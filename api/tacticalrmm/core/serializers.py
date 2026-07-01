@@ -32,14 +32,37 @@ class HostedCoreMixin:
         return ret
 
 
+MASKED_TOKEN_FIELDS = ("open_ai_token", "minimax_token")
+
+
+def mask_token(value):
+    if not value:
+        return value
+    if len(value) <= 4:
+        return "•" * len(value)
+    return "•" * (len(value) - 4) + value[-4:]
+
+
 class CoreSettingsSerializer(HostedCoreMixin, serializers.ModelSerializer):
     all_timezones = serializers.SerializerMethodField("all_time_zones")
 
     def all_time_zones(self, obj):
         return ALL_TIMEZONES
 
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        for field in MASKED_TOKEN_FIELDS:
+            ret[field] = mask_token(getattr(instance, field, None))
+        return ret
+
     def validate(self, attrs):
         instance = getattr(self, "instance", None)
+
+        # the token fields are shown masked, so an unchanged masked value
+        # in the submitted form means "leave the stored token as-is"
+        for field in MASKED_TOKEN_FIELDS:
+            if field in attrs and instance is not None and "•" in (attrs[field] or ""):
+                attrs[field] = getattr(instance, field)
 
         def get_value(key):
             if key in attrs:
