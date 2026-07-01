@@ -38,6 +38,11 @@ if TYPE_CHECKING:
 
 TZ_CHOICES = [(_, _) for _ in ALL_TIMEZONES]
 
+AI_PROVIDER_CHOICES = [
+    ("openai", "OpenAI"),
+    ("minimax", "MiniMax"),
+]
+
 
 class CoreSettings(BaseAuditModel):
     email_alert_recipients = ArrayField(
@@ -116,6 +121,13 @@ class CoreSettings(BaseAuditModel):
     open_ai_token = models.CharField(max_length=255, null=True, blank=True)
     open_ai_model = models.CharField(
         max_length=255, blank=True, default="gpt-3.5-turbo"
+    )
+    ai_provider = models.CharField(
+        max_length=20, choices=AI_PROVIDER_CHOICES, default="openai"
+    )
+    minimax_token = models.CharField(max_length=255, null=True, blank=True)
+    minimax_model = models.CharField(
+        max_length=255, blank=True, default="MiniMax-M3"
     )
     enable_server_scripts = models.BooleanField(default=True)
     enable_server_webterminal = models.BooleanField(default=False)

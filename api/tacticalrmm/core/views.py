@@ -147,7 +147,9 @@ def dashboard_info(request):
             "date_format": request.user.date_format,
             "default_date_format": core_settings.date_format,
             "token_is_expired": token_is_expired(),
-            "open_ai_integration_enabled": bool(core_settings.open_ai_token),
+            "open_ai_integration_enabled": bool(
+                core_settings.open_ai_token or core_settings.minimax_token
+            ),
             "dash_info_color": request.user.dash_info_color,
             "dash_positive_color": request.user.dash_positive_color,
             "dash_negative_color": request.user.dash_negative_color,
@@ -753,27 +755,39 @@ class OpenAICodeCompletion(APIView):
     def post(self, request: Request) -> Response:
         settings = get_core_settings()
 
-        if not settings.open_ai_token:
+        if settings.ai_provider == "minimax":
+            api_url = "https://api.minimax.io/v1/chat/completions"
+            token = settings.minimax_token
+            model = settings.minimax_model
+            provider_label = "MiniMax"
+        else:
+            api_url = "https://api.openai.com/v1/chat/completions"
+            token = settings.open_ai_token
+            model = settings.open_ai_model
+            provider_label = "Open AI"
+
+        if not token:
             return notify_error(
-                "Open AI API Key not found. Open Global Settings > Open AI."
+                f"{provider_label} API Key not found. Open Global Settings > Open AI."
             )
 
-        if not request.data["prompt"]:
-            return notify_error("Not prompt field found")
+        # messages allows the script manager to send a full back-and-forth
+        # conversation for iterative refinement; prompt stays supported for
+        # the single-shot "Generate Script" button
+        messages = request.data.get("messages")
+        if not messages:
+            if not request.data.get("prompt"):
+                return notify_error("Not prompt field found")
+            messages = [{"role": "user", "content": request.data["prompt"]}]
 
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {settings.open_ai_token}",
+            "Authorization": f"Bearer {token}",
         }
 
         data = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": request.data["prompt"],
-                },
-            ],
-            "model": settings.open_ai_model,
+            "messages": messages,
+            "model": model,
             "temperature": 0.5,
             "max_tokens": 1000,
             "n": 1,
@@ -782,7 +796,7 @@ class OpenAICodeCompletion(APIView):
 
         try:
             response = requests.post(
-                "https://api.openai.com/v1/chat/completions",
+                api_url,
                 headers=headers,
                 data=json.dumps(data),
             )
@@ -792,8 +806,8 @@ class OpenAICodeCompletion(APIView):
         response_data = json.loads(response.text)
 
         if "error" in response_data:
-            return notify_error(
-                f"The Open AI API returned an error: {response_data['error']['message']}"
-            )
+            error = response_data["error"]
+            message = error.get("message", error) if isinstance(error, dict) else error
+            return notify_error(f"The {provider_label} API returned an error: {message}")
 
         return Response(response_data["choices"][0]["message"]["content"])
