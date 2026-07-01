@@ -11,7 +11,7 @@ from tacticalrmm.helpers import notify_error
 from tacticalrmm.permissions import _has_perm_on_agent
 from tacticalrmm.utils import get_default_timezone
 
-from .models import WinUpdate
+from .models import PATCH_ACTION_CHOICES, WinUpdate
 from .permissions import AgentWinUpdatePerms
 from .serializers import WinUpdateSerializer
 
@@ -74,3 +74,28 @@ class EditWindowsUpdates(APIView):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(f"Windows update {update.kb} was changed to {update.action}")
+
+
+class BulkEditWindowsUpdates(APIView):
+    permission_classes = [IsAuthenticated, AgentWinUpdatePerms]
+
+    # change approval status of multiple updates at once
+    def put(self, request):
+        action = request.data.get("action")
+        pks = request.data.get("pks", [])
+
+        if action not in dict(PATCH_ACTION_CHOICES):
+            return notify_error("Invalid action")
+
+        if not pks:
+            return notify_error("No patches were selected")
+
+        updates = WinUpdate.objects.filter(pk__in=pks).select_related("agent")
+        allowed_pks = [
+            update.pk
+            for update in updates
+            if _has_perm_on_agent(request.user, update.agent.agent_id)
+        ]
+
+        count = WinUpdate.objects.filter(pk__in=allowed_pks).update(action=action)
+        return Response(f"{count} patch(es) were changed to {action}")
