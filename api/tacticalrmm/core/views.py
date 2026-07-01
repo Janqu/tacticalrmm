@@ -1,4 +1,3 @@
-import json
 from contextlib import suppress
 from pathlib import Path
 
@@ -150,6 +149,7 @@ def dashboard_info(request):
             "open_ai_integration_enabled": bool(
                 core_settings.open_ai_token or core_settings.minimax_token
             ),
+            "ai_provider": core_settings.ai_provider,
             "dash_info_color": request.user.dash_info_color,
             "dash_positive_color": request.user.dash_positive_color,
             "dash_negative_color": request.user.dash_negative_color,
@@ -789,7 +789,7 @@ class OpenAICodeCompletion(APIView):
             "messages": messages,
             "model": model,
             "temperature": 0.5,
-            "max_tokens": 1000,
+            "max_tokens": 4000,
             "n": 1,
             "stop": None,
         }
@@ -798,16 +798,27 @@ class OpenAICodeCompletion(APIView):
             response = requests.post(
                 api_url,
                 headers=headers,
-                data=json.dumps(data),
+                json=data,
+                timeout=60,
             )
         except Exception as e:
             return notify_error(str(e))
 
-        response_data = json.loads(response.text)
+        try:
+            response_data = response.json()
+        except ValueError:
+            return notify_error(
+                f"The {provider_label} API returned an unexpected response (HTTP {response.status_code})"
+            )
 
         if "error" in response_data:
             error = response_data["error"]
             message = error.get("message", error) if isinstance(error, dict) else error
             return notify_error(f"The {provider_label} API returned an error: {message}")
+
+        if not response_data.get("choices"):
+            return notify_error(
+                f"The {provider_label} API returned no completion (HTTP {response.status_code})"
+            )
 
         return Response(response_data["choices"][0]["message"]["content"])
