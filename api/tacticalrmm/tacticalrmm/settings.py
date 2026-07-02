@@ -236,6 +236,7 @@ INSTALLED_APPS = [
     "checks",
     "services",
     "winupdate",
+    "qdt_reports",
     "software",
     "core",
     "automation",
