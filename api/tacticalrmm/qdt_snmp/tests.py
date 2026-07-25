@@ -1,8 +1,11 @@
+from django.test import SimpleTestCase
 from model_bakery import baker
+from rest_framework.exceptions import ValidationError
 
 from tacticalrmm.test import TacticalTestCase
 
 from .models import SnmpAlert, SnmpDevice, SnmpReading
+from .serializers import validate_metric_map, validate_thresholds
 
 BASE = "/qdt_snmp"
 
@@ -158,6 +161,8 @@ class TestMetricMapValidation(TacticalTestCase):
             "oid is not an oid": {"a": {"oid": "sysDescr"}},
             "max_oid is not an oid": {"a": {"oid": "1.3.6", "max_oid": "nope"}},
             "scale not numeric": {"a": {"oid": "1.3.6", "scale": "zwei"}},
+            # what the browser actually sends for an unparseable number
+            "scale is null": {"a": {"oid": "1.3.6", "scale": None}},
             "unknown key": {"a": {"oid": "1.3.6", "multiply": 2}},
         }
         for label, bad in cases.items():
@@ -168,6 +173,24 @@ class TestMetricMapValidation(TacticalTestCase):
         r = self._post({})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(SnmpDevice.objects.get(pk=r.data["id"]).metric_map, {})
+
+
+class TestValidatorsDirectly(SimpleTestCase):
+    """Values strict json cannot carry, so they never arrive over HTTP - but they can
+    be set through the ORM or a lenient parser, and NaN is a float that an isinstance
+    check happily accepts."""
+
+    def test_non_finite_numbers_are_rejected(self):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValidationError):
+                    validate_metric_map({"a": {"oid": "1.3.6", "scale": value}})
+                with self.assertRaises(ValidationError):
+                    validate_thresholds({"a": {"warning": value}})
+
+    def test_bool_is_not_a_number(self):
+        with self.assertRaises(ValidationError):
+            validate_metric_map({"a": {"oid": "1.3.6", "scale": True}})
 
 
 class TestSnmpProbe(TacticalTestCase):
@@ -367,6 +390,7 @@ class TestThresholdValidation(TacticalTestCase):
         cases = {
             "no level": {"a": {"direction": "below"}},
             "level not numeric": {"a": {"warning": "viel"}},
+            "level is null": {"a": {"warning": None}},
             "bad direction": {"a": {"warning": 1, "direction": "sideways"}},
             "unknown key": {"a": {"warning": 1, "colour": "red"}},
             "entry not object": {"a": 5},

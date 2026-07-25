@@ -1,3 +1,4 @@
+import math
 import re
 
 from rest_framework import serializers
@@ -9,6 +10,16 @@ from .models import SnmpDevice, SnmpReading
 OID_RE = re.compile(r"^\d+(\.\d+)+$")
 ALLOWED_MAP_KEYS = {"oid", "max_oid", "scale"}
 ALLOWED_THRESHOLD_KEYS = {"warning", "error", "direction"}
+
+
+def _is_number(value) -> bool:
+    """NaN and infinity are floats, so isinstance alone lets them through. A NaN
+    factor would silently turn every reading from that metric into garbage."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
 
 
 def validate_thresholds(value):
@@ -29,8 +40,8 @@ def validate_thresholds(value):
         if not {"warning", "error"} & set(spec):
             raise serializers.ValidationError(f"{metric}: needs a warning or an error level")
         for level in ("warning", "error"):
-            if level in spec and not isinstance(spec[level], (int, float)):
-                raise serializers.ValidationError(f"{metric}: {level} must be a number")
+            if level in spec and not _is_number(spec[level]):
+                raise serializers.ValidationError(f"{metric}: {level} must be a finite number")
         if spec.get("direction", "below") not in ("below", "above"):
             raise serializers.ValidationError(f"{metric}: direction must be below or above")
 
@@ -58,8 +69,8 @@ def validate_metric_map(value):
                 raise serializers.ValidationError(f"{metric}: {key} is not a dotted OID")
         if "oid" not in spec:
             raise serializers.ValidationError(f"{metric}: oid is required")
-        if "scale" in spec and not isinstance(spec["scale"], (int, float)):
-            raise serializers.ValidationError(f"{metric}: scale must be a number")
+        if "scale" in spec and not _is_number(spec["scale"]):
+            raise serializers.ValidationError(f"{metric}: scale must be a finite number")
 
     return value
 
