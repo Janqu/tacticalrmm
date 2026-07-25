@@ -355,6 +355,35 @@ class AuditLog(models.Model):
             after_value=affected,
         )
 
+    @staticmethod
+    def audit_ai_chat_tool(
+        username: str,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        outcome: Dict[str, Any],
+        session_id: str = "",
+        confirmed: bool = False,
+        debug_info: Dict[Any, Any] = {},
+    ) -> None:
+        """Log an MCP tool invocation that originated from the AI chat."""
+        agent_id = arguments.get("agent_id") if isinstance(arguments, dict) else None
+        message = f'{username} invoked AI chat tool "{tool_name}"'
+        if confirmed:
+            message += " (confirmed)"
+        if session_id:
+            debug_info["session_id"] = session_id
+
+        AuditLog.objects.create(
+            username=username,
+            agent_id=agent_id,
+            object_type=AuditObjType.AGENT if agent_id else AuditObjType.CORE,
+            action=AuditActionType.AI_CHAT_TOOL,
+            message=message,
+            before_value={"arguments": arguments, "confirmed": confirmed},
+            after_value=outcome,
+            debug_info=debug_info,
+        )
+
 
 class DebugLog(models.Model):
     objects = PermissionQuerySet.as_manager()

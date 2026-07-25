@@ -1,5 +1,8 @@
+import json
+import re
 from contextlib import suppress
 from pathlib import Path
+from typing import Any
 
 import psutil
 import requests
@@ -30,17 +33,21 @@ from core.utils import (
     sysd_svc_is_running,
     token_is_valid,
 )
+from qdt_mcp.executor import execute_mcp_tool, is_read_only_tool, list_mcp_tools
 from logs.models import AuditLog
 from tacticalrmm.constants import AuditActionType, PAStatus
 from tacticalrmm.helpers import get_certs, notify_error
 from tacticalrmm.logger import logger
 from tacticalrmm.permissions import (
+    _has_perm,
     _has_perm_on_agent,
     _has_perm_on_client,
     _has_perm_on_site,
 )
 
 from .models import (
+    AIChatMessage,
+    AIChatSession,
     CodeSignToken,
     CoreSettings,
     CustomField,
@@ -60,6 +67,7 @@ from .permissions import (
     WebTerminalPerms,
 )
 from .serializers import (
+    AIChatSessionSerializer,
     CodeSignTokenSerializer,
     CoreSettingsSerializer,
     CustomFieldSerializer,
@@ -822,3 +830,370 @@ class OpenAICodeCompletion(APIView):
             )
 
         return Response(response_data["choices"][0]["message"]["content"])
+
+
+class AIChatSessions(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request: Request) -> Response:
+        if not _has_perm(request, "can_list_agents"):
+            raise PermissionDenied()
+        sessions = AIChatSession.objects.filter(user=request.user)
+        serializer = AIChatSessionSerializer(
+            sessions.order_by("-updated_at"), many=True
+        )
+        return Response({"sessions": serializer.data})
+
+    def post(self, request: Request) -> Response:
+        if not _has_perm(request, "can_list_agents"):
+            raise PermissionDenied()
+        title = request.data.get("title", "")
+        session = AIChatSession.objects.create(user=request.user, title=title)
+        serializer = AIChatSessionSerializer(session)
+        return Response(serializer.data, status=drf_status.HTTP_201_CREATED)
+
+
+class AIChatSessionDetail(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request: Request, pk: str) -> Response:
+        if not _has_perm(request, "can_list_agents"):
+            raise PermissionDenied()
+        session = get_object_or_404(AIChatSession, pk=pk, user=request.user)
+        serializer = AIChatSessionSerializer(session)
+        return Response(serializer.data)
+
+    def delete(self, request: Request, pk: str) -> Response:
+        if not _has_perm(request, "can_list_agents"):
+            raise PermissionDenied()
+        session = get_object_or_404(AIChatSession, pk=pk, user=request.user)
+        session.delete()
+        return Response("ok")
+
+
+class AIChatCompletion(APIView):
+    """Chat endpoint that can invoke MCP tools through the backend.
+
+    The frontend never talks directly to /mcp and never sees an API key. All
+    tool execution happens server-side, gated on Django session authentication.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    # simple in-memory rate limit: max requests per minute per user
+    _rate_limit_bucket: dict[int, list[float]] = {}
+    MAX_REQUESTS_PER_MINUTE = 30
+    MAX_TOOL_CALLS_PER_REQUEST = 10
+    MAX_MESSAGE_LENGTH = 4000
+    MAX_MESSAGES = 50
+
+    def _rate_limited(self, user_id: int) -> bool:
+        # the bucket is per-process and would grow without bound otherwise
+        if len(self._rate_limit_bucket) > 5000:
+            self._rate_limit_bucket.clear()
+        now = djangotime.now().timestamp()
+        window = [ts for ts in self._rate_limit_bucket.get(user_id, []) if now - ts < 60]
+        self._rate_limit_bucket[user_id] = window
+        if len(window) >= self.MAX_REQUESTS_PER_MINUTE:
+            return True
+        window.append(now)
+        return False
+
+    def _llm_settings(self):
+        settings = get_core_settings()
+        if settings.ai_provider == "minimax":
+            return {
+                "api_url": "https://api.minimax.io/v1/chat/completions",
+                "token": settings.minimax_token,
+                "model": settings.minimax_model,
+                "provider_label": "MiniMax",
+            }
+        return {
+            "api_url": "https://api.openai.com/v1/chat/completions",
+            "token": settings.open_ai_token,
+            "model": settings.open_ai_model,
+            "provider_label": "Open AI",
+        }
+
+    def _system_prompt(self) -> str:
+        tools = list_mcp_tools()
+        tool_descriptions = []
+        for tool in tools:
+            params = json.dumps(tool["parameters"], indent=2)
+            tool_descriptions.append(
+                f"- {tool['name']}: {tool['description']}\n  parameters: {params}\n  read_only: {tool['read_only']}"
+            )
+
+        return (
+            "You are Tactical RMM's AI assistant. You help administrators manage their fleet.\n"
+            "You have access to the following tools. To call a tool, output one or more blocks exactly like this:\n"
+            "<tool_call>\n"
+            '{"name": "TOOL_NAME", "arguments": {"arg1": "value1"}}\n'
+            "</tool_call>\n"
+            "After you receive tool results, respond to the user with a concise, helpful summary.\n"
+            "Do not ask the user for passwords, API keys, or other secrets.\n"
+            "For read-only tools you may call them directly. For tools that change state "
+            "(run_command, run_script, reboot_agent, kill_process, control_service, run_checks), "
+            "you MUST ask the user for confirmation first and output the tool call only after they confirm.\n\n"
+            "Available tools:\n" + "\n".join(tool_descriptions)
+        )
+
+    def _extract_tool_calls(self, content: str) -> list[dict[str, Any]]:
+        pattern = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
+        matches = re.findall(pattern, content, re.DOTALL)
+        calls = []
+        for raw in matches:
+            try:
+                parsed = json.loads(raw)
+                if "name" in parsed and isinstance(parsed.get("arguments"), dict):
+                    calls.append(parsed)
+            except json.JSONDecodeError:
+                continue
+        return calls
+
+    def _strip_tool_calls(self, content: str) -> str:
+        return re.sub(r"<tool_call>.*?<\/tool_call>", "", content, flags=re.DOTALL).strip()
+
+    def _call_llm(self, messages: list[dict[str, str]], llm: dict) -> str:
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {llm['token']}",
+        }
+        data = {
+            "messages": messages,
+            "model": llm["model"],
+            "temperature": 0.3,
+            "max_tokens": 4000,
+            "n": 1,
+            "stop": None,
+        }
+        response = requests.post(
+            llm["api_url"],
+            headers=headers,
+            json=data,
+            timeout=120,
+        )
+        response.raise_for_status()
+        response_data = response.json()
+        return response_data["choices"][0]["message"]["content"]
+
+    def _execute_and_log(
+        self,
+        request: Request,
+        name: str,
+        arguments: dict[str, Any],
+        confirmed: bool = False,
+    ) -> Any:
+        """Execute an MCP tool as the calling user and write an audit log entry."""
+        session_id = request.data.get("session_id", "")
+        username = request.user.username
+        try:
+            outcome = execute_mcp_tool(name, arguments, user=request.user)
+        except Exception as exc:
+            outcome = {"error": str(exc)}
+            AuditLog.audit_ai_chat_tool(
+                username=username,
+                tool_name=name,
+                arguments=arguments,
+                outcome=outcome,
+                session_id=session_id,
+                confirmed=confirmed,
+            )
+            raise
+
+        AuditLog.audit_ai_chat_tool(
+            username=username,
+            tool_name=name,
+            arguments=arguments,
+            outcome=outcome,
+            session_id=session_id,
+            confirmed=confirmed,
+        )
+        return outcome
+
+    def _get_or_create_session(
+        self, request: Request, session_id: str | None
+    ) -> AIChatSession:
+        if session_id:
+            with suppress(AIChatSession.DoesNotExist, ValueError):
+                return AIChatSession.objects.get(pk=session_id, user=request.user)
+
+        title = ""
+        for msg in reversed(request.data.get("messages", [])):
+            if msg.get("role") == "user":
+                title = str(msg.get("content", ""))[:100]
+                break
+
+        return AIChatSession.objects.create(user=request.user, title=title)
+
+    def _save_chat_turn(
+        self,
+        session: AIChatSession,
+        messages: list[dict[str, str]],
+        assistant_content: str,
+        executed: list[dict[str, Any]] | None = None,
+        pending: list[dict[str, Any]] | None = None,
+        final_content: str | None = None,
+    ) -> None:
+        """Persist the current turn, replacing any previously stored messages."""
+        session.messages.all().delete()
+
+        for msg in messages:
+            AIChatMessage.objects.create(
+                session=session,
+                role=msg.get("role", "user"),
+                content=msg.get("content", ""),
+            )
+
+        tool_calls: dict[str, Any] = {}
+        if executed:
+            tool_calls["executed_tools"] = executed
+        if pending:
+            tool_calls["pending_tool_calls"] = pending
+
+        AIChatMessage.objects.create(
+            session=session,
+            role="assistant",
+            content=assistant_content,
+            tool_calls=tool_calls or None,
+        )
+
+        if final_content:
+            AIChatMessage.objects.create(
+                session=session,
+                role="assistant",
+                content=final_content,
+            )
+
+    def post(self, request: Request) -> Response:
+        # tools run as the calling user, but the feature itself still wants a
+        # baseline permission - a role-less account must not reach the LLM at all
+        if not _has_perm(request, "can_list_agents"):
+            raise PermissionDenied()
+
+        user_id = request.user.id
+        if self._rate_limited(user_id):
+            return notify_error("Rate limit exceeded: max 30 AI chat requests per minute.")
+
+        messages = request.data.get("messages", [])
+        if not isinstance(messages, list):
+            return notify_error("messages must be a list")
+
+        if len(messages) > self.MAX_MESSAGES:
+            return notify_error(f"Too many messages. Max {self.MAX_MESSAGES} allowed.")
+
+        for msg in messages:
+            if len(str(msg.get("content", ""))) > self.MAX_MESSAGE_LENGTH:
+                return notify_error(f"Message too long. Max {self.MAX_MESSAGE_LENGTH} characters.")
+
+        # only user/assistant turns may pass through - a client-supplied "system"
+        # message would sit in front of the real system prompt
+        messages = [
+            {"role": msg["role"], "content": str(msg.get("content", ""))}
+            for msg in messages
+            if isinstance(msg, dict) and msg.get("role") in ("user", "assistant")
+        ]
+
+        confirmed_tool = request.data.get("confirmed_tool")
+        llm = self._llm_settings()
+        if not llm["token"]:
+            return notify_error(
+                f"{llm['provider_label']} API Key not found. Open Global Settings > Open AI."
+            )
+
+        system_prompt = self._system_prompt()
+        chat_messages = [{"role": "system", "content": system_prompt}] + messages
+
+        try:
+            content = self._call_llm(chat_messages, llm)
+        except requests.HTTPError as e:
+            return notify_error(f"LLM API error: {e.response.text[:500]}")
+        except requests.RequestException as e:
+            return notify_error(f"LLM request failed: {str(e)}")
+
+        session = self._get_or_create_session(request, request.data.get("session_id"))
+
+        tool_calls = self._extract_tool_calls(content)
+        if not tool_calls:
+            self._save_chat_turn(session, messages, content)
+            return Response({
+                "message": content,
+                "executed_tools": [],
+                "pending_tool_calls": [],
+                "session_id": str(session.pk),
+            })
+
+        if len(tool_calls) > self.MAX_TOOL_CALLS_PER_REQUEST:
+            return notify_error(f"Too many tool calls. Max {self.MAX_TOOL_CALLS_PER_REQUEST} allowed.")
+
+        executed = []
+        pending = []
+
+        # If the frontend confirmed a specific tool, execute only that one
+        if confirmed_tool and confirmed_tool.get("name"):
+            name = confirmed_tool["name"]
+            arguments = confirmed_tool.get("arguments", {})
+            outcome = self._execute_and_log(request, name, arguments, confirmed=True)
+            executed.append({"name": name, "arguments": arguments, "outcome": outcome})
+            tool_result_message = {
+                "role": "user",
+                "content": f"Tool '{name}' executed. Result: {json.dumps(outcome)}",
+            }
+            final_messages = chat_messages + [{"role": "assistant", "content": content}, tool_result_message]
+            try:
+                final_content = self._call_llm(final_messages, llm)
+            except requests.RequestException as e:
+                return notify_error(f"LLM request failed: {str(e)}")
+
+            self._save_chat_turn(session, messages, content, executed=executed, final_content=final_content)
+            return Response({
+                "message": self._strip_tool_calls(final_content),
+                "executed_tools": executed,
+                "pending_tool_calls": [],
+                "session_id": str(session.pk),
+            })
+
+        # Otherwise auto-execute read-only tools and ask for confirmation on write tools
+        for call in tool_calls:
+            name = call["name"]
+            arguments = call.get("arguments", {})
+            if is_read_only_tool(name):
+                outcome = self._execute_and_log(request, name, arguments)
+                executed.append({"name": name, "arguments": arguments, "outcome": outcome})
+            else:
+                pending.append({
+                    "name": name,
+                    "arguments": arguments,
+                    "requires_confirmation": True,
+                    "description": f"This will execute the '{name}' tool on the RMM.",
+                })
+
+        if pending:
+            self._save_chat_turn(session, messages, content, executed=executed, pending=pending)
+            return Response({
+                "message": self._strip_tool_calls(content),
+                "executed_tools": executed,
+                "pending_tool_calls": pending,
+                "session_id": str(session.pk),
+            })
+
+        # All tools were read-only, ask the LLM to summarize the results
+        tool_results = [
+            {
+                "role": "user",
+                "content": "Tool results:\n" + json.dumps(executed, indent=2),
+            }
+        ]
+        final_messages = chat_messages + [{"role": "assistant", "content": content}] + tool_results
+        try:
+            final_content = self._call_llm(final_messages, llm)
+        except requests.RequestException as e:
+            return notify_error(f"LLM request failed: {str(e)}")
+
+        self._save_chat_turn(session, messages, content, executed=executed, final_content=final_content)
+        return Response({
+            "message": self._strip_tool_calls(final_content),
+            "executed_tools": executed,
+            "pending_tool_calls": [],
+            "session_id": str(session.pk),
+        })

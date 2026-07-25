@@ -7,6 +7,8 @@ from tacticalrmm.constants import (
 )
 
 from .models import (
+    AIChatMessage,
+    AIChatSession,
     CodeSignToken,
     CoreSettings,
     CustomField,
@@ -182,3 +184,17 @@ class ScheduleAuditSerializer(serializers.ModelSerializer):
     class Meta:
         model = Schedule
         fields = "__all__"
+
+
+class AIChatMessageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AIChatMessage
+        fields = ["id", "role", "content", "tool_calls", "created_at"]
+
+
+class AIChatSessionSerializer(serializers.ModelSerializer):
+    messages = AIChatMessageSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = AIChatSession
+        fields = ["id", "title", "created_at", "updated_at", "messages"]

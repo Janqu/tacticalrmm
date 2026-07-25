@@ -23,6 +23,9 @@ urlpatterns = [
     path("smstest/", views.TwilioSMSTest.as_view()),
     path("clearcache/", views.clear_cache),
     path("openai/generate/", views.OpenAICodeCompletion.as_view()),
+    path("ai-chat/", views.AIChatCompletion.as_view()),
+    path("ai-chat/sessions/", views.AIChatSessions.as_view()),
+    path("ai-chat/sessions/<uuid:pk>/", views.AIChatSessionDetail.as_view()),
     path("webtermperms/", views.webterm_perms),
 ]
 

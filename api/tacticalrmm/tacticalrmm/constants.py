@@ -224,6 +224,7 @@ class AuditActionType(models.TextChoices):
     EXEC_COMMAND = "execute_command", "Execute Command"
     BULK_ACTION = "bulk_action", "Bulk Action"
     URL_ACTION = "url_action", "URL Action"
+    AI_CHAT_TOOL = "ai_chat_tool", "AI Chat Tool"
 
 
 class AuditObjType(models.TextChoices):
