@@ -238,6 +238,7 @@ INSTALLED_APPS = [
     "winupdate",
     "qdt_reports",
     "qdt_mcp",
+    "qdt_snmp",
     "software",
     "core",
     "automation",

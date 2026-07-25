@@ -33,6 +33,7 @@ urlpatterns = [
     path("services/", include("services.urls")),
     path("winupdate/", include("winupdate.urls")),
     path("qdt_reports/", include("qdt_reports.urls")),
+    path("qdt_snmp/", include("qdt_snmp.urls")),
     path("software/", include("software.urls")),
     path("core/", include("core.urls")),
     path("automation/", include("automation.urls")),
