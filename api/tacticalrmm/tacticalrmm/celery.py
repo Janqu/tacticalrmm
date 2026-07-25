@@ -57,6 +57,10 @@ app.conf.beat_schedule = {
         "task": "core.tasks.sync_scheduled_tasks",
         "schedule": crontab(minute="*/2", hour="*"),
     },
+    "snmp-prune-readings": {
+        "task": "qdt_snmp.tasks.prune_old_readings",
+        "schedule": crontab(minute=17, hour=3),
+    },
     "sync-mesh-perms-task": {
         "task": "core.tasks.sync_mesh_perms_task",
         "schedule": crontab(minute="*/4", hour="*"),

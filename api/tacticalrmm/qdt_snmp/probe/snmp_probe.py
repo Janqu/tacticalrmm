@@ -243,6 +243,14 @@ UPS_LOAD = "1.3.6.1.2.1.33.1.4.4.1.5.1"
 
 IF_NUMBER = "1.3.6.1.2.1.2.1.0"
 
+# prtInput: paper trays, probed by index just like the supplies table
+INPUT_MAX_COL = "1.3.6.1.2.1.43.8.2.1.9.1."
+INPUT_LEVEL_COL = "1.3.6.1.2.1.43.8.2.1.10.1."
+INPUT_NAME_COL = "1.3.6.1.2.1.43.8.2.1.13.1."
+INPUT_MEDIA_COL = "1.3.6.1.2.1.43.8.2.1.12.1."
+INPUT_DESC_COL = "1.3.6.1.2.1.43.8.2.1.18.1."
+MAX_TRAYS = 8
+
 
 def _slug(text: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "_", (text or "").lower()).strip("_")
@@ -274,6 +282,27 @@ def poll_printer(host, port, community, timeout, retries) -> tuple:
             continue
         name = _slug(supplies.get(f"{PRT_SUPPLY_DESC}{i}", ""))
         metrics[f"supply.{name}"] = round(level / maximum * 100, 1)
+
+    tray_oids = []
+    for i in range(1, MAX_TRAYS + 1):
+        tray_oids += [
+            f"{INPUT_NAME_COL}{i}",
+            f"{INPUT_DESC_COL}{i}",
+            f"{INPUT_MAX_COL}{i}",
+            f"{INPUT_LEVEL_COL}{i}",
+        ]
+    trays = snmp_get(host, port, community, tray_oids, timeout, retries)
+
+    for i in range(1, MAX_TRAYS + 1):
+        level = trays.get(f"{INPUT_LEVEL_COL}{i}")
+        maximum = trays.get(f"{INPUT_MAX_COL}{i}")
+        # same sentinel rules as supplies: negative means unknown, not empty
+        if not isinstance(level, int) or not isinstance(maximum, int):
+            continue
+        if level < 0 or maximum <= 0:
+            continue
+        name = trays.get(f"{INPUT_NAME_COL}{i}") or trays.get(f"{INPUT_DESC_COL}{i}")
+        metrics[f"tray.{_slug(name) if name else i}"] = round(level / maximum * 100, 1)
 
     return base.get(SYS_DESCR), base.get(PRT_SERIAL), metrics
 
@@ -370,13 +399,6 @@ SUPPLY_MAX_COL = "1.3.6.1.2.1.43.11.1.1.8.1."
 SUPPLY_LEVEL_COL = "1.3.6.1.2.1.43.11.1.1.9.1."
 SUPPLY_COLORANT_COL = "1.3.6.1.2.1.43.11.1.1.3.1."
 COLORANT_VALUE_COL = "1.3.6.1.2.1.43.12.1.1.4.1."
-
-# prtInput: paper trays
-INPUT_MAX_COL = "1.3.6.1.2.1.43.8.2.1.9.1."
-INPUT_LEVEL_COL = "1.3.6.1.2.1.43.8.2.1.10.1."
-INPUT_NAME_COL = "1.3.6.1.2.1.43.8.2.1.13.1."
-INPUT_MEDIA_COL = "1.3.6.1.2.1.43.8.2.1.12.1."
-INPUT_DESC_COL = "1.3.6.1.2.1.43.8.2.1.18.1."
 
 
 def decode_trays(trees: dict) -> list:
@@ -694,6 +716,38 @@ def selftest() -> int:
     assert metrics["supply.black"] == 25.0, metrics
     assert metrics["uptime.seconds"] == 9.0, metrics
     assert "pages.total" not in metrics, "an OID the device did not answer must be skipped"
+
+    # the printer profile polls supplies and trays by index, sentinels included
+    def fake_printer_get(host, port, community, oids, timeout, retries):
+        if PRT_PAGES in oids:
+            return {SYS_DESCR: "HP LaserJet", PRT_SERIAL: "SN1", PRT_PAGES: 100}
+        if any(o.startswith(PRT_SUPPLY_LEVEL) for o in oids):
+            return {
+                f"{PRT_SUPPLY_DESC}1": "Black Cartridge",
+                f"{PRT_SUPPLY_MAX}1": 3000,
+                f"{PRT_SUPPLY_LEVEL}1": 1500,
+            }
+        return {
+            f"{INPUT_NAME_COL}1": "Tray 1",
+            f"{INPUT_MAX_COL}1": 500,
+            f"{INPUT_LEVEL_COL}1": 250,
+            # a manual feed reports no usable capacity and must be skipped
+            f"{INPUT_NAME_COL}2": "Manual Feed",
+            f"{INPUT_MAX_COL}2": -2,
+            f"{INPUT_LEVEL_COL}2": -3,
+        }
+
+    globals()["snmp_get"] = fake_printer_get
+    try:
+        descr, serial, metrics = poll_printer("x", 161, "public", 1, 0)
+    finally:
+        globals()["snmp_get"] = original_get
+    assert descr == "HP LaserJet" and serial == "SN1"
+    assert metrics == {
+        "pages.total": 100.0,
+        "supply.black_cartridge": 50.0,
+        "tray.tray_1": 50.0,
+    }, metrics
 
     print("selftest ok")
     return 0

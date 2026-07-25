@@ -491,6 +491,220 @@ class TestDiscoverSnmpDevice(TacticalTestCase):
         self.assertEqual(self._post(port="abc").status_code, 400)
 
 
+@patch("qdt_snmp.provisioning.create_win_task_schedule")
+class TestProbeProvisioning(TacticalTestCase):
+    """The first device at a site must not mean four manual setup steps."""
+
+    def setUp(self):
+        self.setup_coresettings()
+        self.authenticate()
+        self.site = baker.make("clients.Site")
+        self.agent = baker.make_recipe("agents.online_agent", site=self.site)
+
+    def _post(self, site_id=None):
+        return self.client.post(f"{BASE}/sites/{site_id or self.site.pk}/probe/")
+
+    def test_provisions_script_key_and_task(self, sched):
+        r = self._post()
+        self.assertEqual(r.status_code, 200)
+
+        from accounts.models import APIKey
+        from autotasks.models import AutomatedTask
+        from core.models import GlobalKVStore
+        from scripts.models import Script
+
+        script = Script.objects.get(name="QDT SNMP Poller", category="QDT")
+        self.assertEqual(script.shell, "python")
+        self.assertIn("SNMP poller", script.script_body)
+
+        store = GlobalKVStore.objects.get(name="snmp_api_key")
+        self.assertEqual(store.value, APIKey.objects.get(name="snmp-probe").key)
+
+        task = AutomatedTask.objects.get(name="QDT SNMP Poller", agent=self.agent)
+        self.assertEqual(task.task_type, "daily")
+        self.assertEqual(task.task_repetition_interval, "5M")
+        self.assertEqual(task.task_repetition_duration, "1D")
+        self.assertEqual(
+            task.actions[0]["script_args"],
+            [
+                "--url",
+                "http://testserver",
+                "--agent-id",
+                "{{agent.agent_id}}",
+                "--api-key",
+                "{{global.snmp_api_key}}",
+            ],
+        )
+        self.assertEqual(task.actions[0]["script"], script.pk)
+        sched.delay.assert_called_once_with(pk=task.pk)
+
+        # and the status endpoint reports all of it
+        r = self.client.get(f"{BASE}/sites/{self.site.pk}/probe/")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(
+            r.data,
+            {
+                "script": True,
+                "api_key": True,
+                "online_agent": self.agent.hostname,
+                "task": {"enabled": True, "agent": self.agent.hostname},
+            },
+        )
+
+    def test_is_idempotent_and_refreshes_a_stale_script(self, sched):
+        from scripts.models import Script
+
+        self._post()
+        script = Script.objects.get(name="QDT SNMP Poller")
+        script.script_body = "hand edited, now stale"
+        script.save()
+
+        r = self._post()
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(Script.objects.filter(name="QDT SNMP Poller").count(), 1)
+        script.refresh_from_db()
+        self.assertNotEqual(script.script_body, "hand edited, now stale")
+
+        from autotasks.models import AutomatedTask
+
+        self.assertEqual(AutomatedTask.objects.count(), 1)
+
+    def test_rehomes_the_task_when_its_agent_went_away(self, sched):
+        from autotasks.models import AutomatedTask
+
+        self._post()
+        # the original probe agent falls silent
+        self.agent.last_seen = None
+        self.agent.save()
+        probe2 = baker.make_recipe("agents.online_agent", site=self.site)
+
+        r = self._post()
+        self.assertEqual(r.status_code, 200)
+        task = AutomatedTask.objects.get(name="QDT SNMP Poller")
+        self.assertEqual(task.agent, probe2)
+
+    def test_no_online_agent_is_a_400(self, sched):
+        self.agent.last_seen = None
+        self.agent.save()
+        self.assertEqual(self._post().status_code, 400)
+        sched.delay.assert_not_called()
+
+    def test_permissions(self, sched):
+        user = self.create_user_with_roles(["can_list_sites"])
+        self.client.force_authenticate(user=user)
+        self.assertEqual(self._post().status_code, 403)
+
+        # a foreign site is out of scope even with the write permission
+        other_client = baker.make("clients.Client")
+        baker.make("clients.Site", client=other_client)
+        user = self.create_user_with_roles(["can_list_sites", "can_manage_sites"])
+        user.role.can_view_clients.set([other_client])
+        self.client.force_authenticate(user=user)
+        self.assertEqual(self._post().status_code, 403)
+
+    def test_adding_the_first_device_provisions_the_site(self, sched):
+        from autotasks.models import AutomatedTask
+
+        r = self.client.post(
+            f"{BASE}/devices/",
+            {"site": self.site.pk, "name": "Drucker", "ip": "10.0.0.10"},
+            format="json",
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn("probe_warning", r.data)
+        self.assertEqual(AutomatedTask.objects.count(), 1)
+        sched.delay.assert_called_once()
+
+        # the second device at the same site does not reprovision
+        r = self.client.post(
+            f"{BASE}/devices/",
+            {"site": self.site.pk, "name": "Drucker 2", "ip": "10.0.0.11"},
+            format="json",
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(AutomatedTask.objects.count(), 1)
+
+    def test_device_creation_without_online_agent_still_works(self, sched):
+        self.agent.last_seen = None
+        self.agent.save()
+        r = self.client.post(
+            f"{BASE}/devices/",
+            {"site": self.site.pk, "name": "Drucker", "ip": "10.0.0.10"},
+            format="json",
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("probe_warning", r.data)
+        sched.delay.assert_not_called()
+
+
+class TestFleetEndpoints(TacticalTestCase):
+    """The list page needs fleet-wide data without one request per device."""
+
+    def setUp(self):
+        self.setup_coresettings()
+        self.authenticate()
+        self.client_a = baker.make("clients.Client")
+        self.client_b = baker.make("clients.Client")
+        self.device_a = baker.make(
+            "qdt_snmp.SnmpDevice", site=baker.make("clients.Site", client=self.client_a)
+        )
+        self.device_b = baker.make(
+            "qdt_snmp.SnmpDevice", site=baker.make("clients.Site", client=self.client_b)
+        )
+
+        from django.utils import timezone as djangotime
+
+        old = baker.make(
+            "qdt_snmp.SnmpReading", device=self.device_a, metric="supply.black", value=50.0
+        )
+        new = baker.make(
+            "qdt_snmp.SnmpReading", device=self.device_a, metric="supply.black", value=30.0
+        )
+        baker.make("qdt_snmp.SnmpReading", device=self.device_b, metric="supply.cyan", value=80.0)
+        # make the order unambiguous instead of relying on insert timing
+        SnmpReading.objects.filter(pk=old.pk).update(
+            timestamp=djangotime.now() - djangotime.timedelta(hours=1)
+        )
+        SnmpReading.objects.filter(pk=new.pk).update(timestamp=djangotime.now())
+
+    def _scoped_user(self, client):
+        user = self.create_user_with_roles(["can_list_sites"])
+        user.role.can_view_clients.set([client])
+        return user
+
+    def test_latest_returns_only_the_newest_sample_per_metric(self):
+        r = self.client.get(f"{BASE}/latest/")
+        self.assertEqual(r.status_code, 200)
+        # r.data is the pre-render python object, so the keys are still ints
+        self.assertEqual(r.data[self.device_a.pk]["supply.black"]["value"], 30.0)
+
+    def test_latest_is_role_scoped(self):
+        self.client.force_authenticate(user=self._scoped_user(self.client_a))
+        r = self.client.get(f"{BASE}/latest/")
+        self.assertIn(self.device_a.pk, r.data)
+        self.assertNotIn(self.device_b.pk, r.data)
+
+    def test_open_alerts_are_role_scoped(self):
+        baker.make("qdt_snmp.SnmpAlert", device=self.device_a, metric="supply.black", severity="error")
+        baker.make("qdt_snmp.SnmpAlert", device=self.device_b, metric="supply.cyan", severity="warning")
+
+        r = self.client.get(f"{BASE}/alerts/")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(len(r.data), 2)
+        self.assertEqual(r.data[0]["metric"], "supply.black")
+        self.assertIn("device_name", r.data[0])
+
+        self.client.force_authenticate(user=self._scoped_user(self.client_a))
+        r = self.client.get(f"{BASE}/alerts/")
+        self.assertEqual([a["metric"] for a in r.data], ["supply.black"])
+
+    def test_read_permission_is_required(self):
+        user = self.create_user_with_roles([])
+        self.client.force_authenticate(user=user)
+        self.assertEqual(self.client.get(f"{BASE}/latest/").status_code, 403)
+        self.assertEqual(self.client.get(f"{BASE}/alerts/").status_code, 403)
+
+
 class TestSnmpReadingPrune(TacticalTestCase):
     def test_prune_removes_only_old_readings(self):
         from django.utils import timezone as djangotime
@@ -506,3 +720,14 @@ class TestSnmpReadingPrune(TacticalTestCase):
 
         self.assertEqual(SnmpReading.prune(days=90), 1)
         self.assertEqual(SnmpReading.objects.count(), 1)
+
+    @patch("qdt_snmp.tasks.redis_lock")
+    def test_celery_task_runs_the_prune(self, lock):
+        lock.return_value.__enter__.return_value = True
+
+        from qdt_snmp.tasks import prune_old_readings
+
+        device = baker.make("qdt_snmp.SnmpDevice")
+        baker.make("qdt_snmp.SnmpReading", device=device, metric="t", value=1.0)
+
+        self.assertEqual(prune_old_readings(), "pruned 0")

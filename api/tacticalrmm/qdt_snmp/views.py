@@ -1,6 +1,7 @@
 import asyncio
 import datetime as dt
 import json
+import logging
 from pathlib import Path
 
 from django.conf import settings
@@ -13,20 +14,29 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from agents.models import Agent
+from clients.models import Site
 from core.serializers import mask_token
 from logs.models import AuditLog
-from tacticalrmm.constants import AGENT_STATUS_ONLINE
 from tacticalrmm.helpers import notify_error
 from tacticalrmm.permissions import _has_perm, _has_perm_on_agent, _has_perm_on_site
 
 from .alerting import evaluate
-from .models import SnmpDevice, SnmpReading
+from .models import SnmpAlert, SnmpDevice, SnmpReading
+from .provisioning import (
+    NoProbeAgentError,
+    ensure_probe_for_site,
+    pick_probe_agent,
+    probe_status,
+    probe_task_exists,
+)
 from .serializers import (
     SnmpDeviceSerializer,
     SnmpIngestSerializer,
     SnmpProbeDeviceSerializer,
     SnmpReadingSerializer,
 )
+
+logger = logging.getLogger("trmm")
 
 # devices are site infrastructure, so they ride on the site permissions rather than
 # adding a Role field, which would mean a migration on the upstream accounts app
@@ -78,7 +88,24 @@ class GetAddSnmpDevices(APIView):
         _require_site(request, serializer.validated_data["site"].pk)
         device = serializer.save()
 
-        return Response(SnmpDeviceSerializer(device).data)
+        data = SnmpDeviceSerializer(device).data
+
+        # the first device at a site sets up its own poller; a failure here must
+        # not break the creation, because e.g. no agent may be online yet
+        if not probe_task_exists(device.site):
+            try:
+                ensure_probe_for_site(
+                    site=device.site,
+                    user=request.user,
+                    api_url=request.build_absolute_uri("/"),
+                )
+            except NoProbeAgentError as err:
+                data["probe_warning"] = str(err)
+            except Exception:
+                logger.exception("snmp probe provisioning failed")
+                data["probe_warning"] = "probe provisioning failed, see server log"
+
+        return Response(data)
 
 
 class GetUpdateDeleteSnmpDevice(APIView):
@@ -141,18 +168,7 @@ class DiscoverSnmpDevice(APIView):
             )
             community = device.community
 
-        agent = next(
-            (
-                a
-                for a in Agent.objects.filter(site_id=site_id).order_by(
-                    # "server" sorts before "workstation", and a server is the
-                    # more likely probe
-                    "monitoring_type"
-                )
-                if a.status == AGENT_STATUS_ONLINE
-            ),
-            None,
-        )
+        agent = pick_probe_agent(site_id)
         if agent is None:
             return notify_error("no online agent at this site to probe from")
 
@@ -198,6 +214,37 @@ class DiscoverSnmpDevice(APIView):
             return notify_error("the probe did not return json")
 
 
+class SiteProbe(APIView):
+    """Status and self-service setup of the site's poller.
+
+    POST runs the provisioning again on demand - it refreshes the script body,
+    repairs a broken task and re-homes a poller whose agent went away.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def _site(self, request, site_id: int, perm: str) -> Site:
+        _require(request, perm)
+        _require_site(request, site_id)
+        return get_object_or_404(Site, pk=site_id)
+
+    def get(self, request, site_id):
+        site = self._site(request, site_id, READ_PERM)
+        return Response(probe_status(site))
+
+    def post(self, request, site_id):
+        site = self._site(request, site_id, WRITE_PERM)
+        try:
+            ensure_probe_for_site(
+                site=site,
+                user=request.user,
+                api_url=request.build_absolute_uri("/"),
+            )
+        except NoProbeAgentError as err:
+            return notify_error(str(err))
+        return Response(probe_status(site))
+
+
 class SnmpDeviceReadings(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -218,6 +265,65 @@ class SnmpDeviceReadings(APIView):
             readings = readings.filter(metric=request.query_params["metric"])
 
         return Response(SnmpReadingSerializer(readings, many=True).data)
+
+
+class SnmpLatestReadings(APIView):
+    """Newest sample per device and metric, for the fleet overview. One query for
+    the whole list page instead of one round trip per device."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        _require(request, READ_PERM)
+        devices = SnmpDevice.objects.filter_by_role(request.user)  # type: ignore
+        if "site" in request.query_params:
+            devices = devices.filter(site_id=request.query_params["site"])
+        elif "client" in request.query_params:
+            devices = devices.filter(site__client_id=request.query_params["client"])
+
+        latest = (
+            SnmpReading.objects.filter(device__in=devices)
+            # device_id, not device: ordering by the FK would order by the related
+            # model's meta ordering and break the distinct-on match
+            .order_by("device_id", "metric", "-timestamp")
+            .distinct("device_id", "metric")
+        )
+
+        out: dict = {}
+        for reading in latest:
+            out.setdefault(reading.device_id, {})[reading.metric] = {
+                "value": reading.value,
+                "timestamp": reading.timestamp,
+            }
+        return Response(out)
+
+
+class SnmpOpenAlerts(APIView):
+    """Open threshold alerts across the fleet, for badges in the device list."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        _require(request, READ_PERM)
+        devices = SnmpDevice.objects.filter_by_role(request.user)  # type: ignore
+
+        alerts = SnmpAlert.objects.filter(device__in=devices).select_related(
+            "device__site__client"
+        )
+        return Response(
+            [
+                {
+                    "device": a.device_id,
+                    "device_name": a.device.name,
+                    "client_name": a.device.site.client.name,
+                    "site_name": a.device.site.name,
+                    "metric": a.metric,
+                    "severity": a.severity,
+                    "created_time": a.created_time,
+                }
+                for a in alerts
+            ]
+        )
 
 
 class ProbeDevices(APIView):
