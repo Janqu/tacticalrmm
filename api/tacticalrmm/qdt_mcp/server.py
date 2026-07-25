@@ -12,6 +12,7 @@ import contextvars
 from typing import Any
 
 import httpx
+from asgiref.sync import sync_to_async
 from django.conf import settings
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -571,15 +572,29 @@ def fleet_health(client_name: str = "") -> str:
 _app = mcp.streamable_http_app()
 
 
+@sync_to_async
+def _key_is_valid(key: str) -> bool:
+    """Reuse TRMM's own credential check: key exists, user active, not expired."""
+    # imported lazily so this module stays importable before the app registry is ready
+    from tacticalrmm.auth import APIAuthentication
+
+    try:
+        APIAuthentication().authenticate_credentials(key)
+    except Exception:
+        return False
+    return True
+
+
 async def mcp_asgi_app(scope, receive, send) -> None:
     """The MCP app, gated on X-API-KEY and with the key bound for the tools to forward.
 
-    Rejecting before the app runs matters: without it an anonymous client completes the
-    MCP handshake and can enumerate every tool.
+    The key is validated here rather than only at the first outbound call: otherwise any
+    non-empty string completes the MCP handshake and enumerates every tool, which
+    advertises remote command execution to anyone who finds the endpoint.
     """
     if scope["type"] == "http":
         key = dict(scope.get("headers") or []).get(b"x-api-key", b"").decode()
-        if not key:
+        if not key or not await _key_is_valid(key):
             await send(
                 {
                     "type": "http.response.start",
@@ -588,7 +603,10 @@ async def mcp_asgi_app(scope, receive, send) -> None:
                 }
             )
             await send(
-                {"type": "http.response.body", "body": b"missing X-API-KEY header"}
+                {
+                    "type": "http.response.body",
+                    "body": b"missing or invalid X-API-KEY header",
+                }
             )
             return
 

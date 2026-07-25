@@ -12,7 +12,7 @@ from qdt_mcp.server import (
 )
 
 
-async def _call_app(headers):
+async def _call_app(headers, key_valid=False):
     """Run the asgi app against an http scope, returning the messages it sent."""
     sent = []
 
@@ -23,7 +23,8 @@ async def _call_app(headers):
         sent.append(msg)
 
     scope = {"type": "http", "path": "/mcp", "method": "POST", "headers": headers}
-    await mcp_asgi_app(scope, receive, send)
+    with patch("qdt_mcp.server._key_is_valid", AsyncMock(return_value=key_valid)):
+        await mcp_asgi_app(scope, receive, send)
     return sent
 
 
@@ -64,6 +65,25 @@ class TestMCPAuth(SimpleTestCase):
             with self.subTest(headers=headers):
                 sent = async_to_sync(_call_app)(headers)
                 self.assertEqual(sent[0]["status"], 401)
+
+    def test_unknown_api_key_is_rejected_before_the_handshake(self):
+        """Presence of the header is not enough: an unknown key must not list tools."""
+        sent = async_to_sync(_call_app)(
+            [(b"x-api-key", b"NOT-A-REAL-KEY")], key_valid=False
+        )
+        self.assertEqual(sent[0]["status"], 401)
+
+    def test_valid_api_key_reaches_the_mcp_app(self):
+        """A key the backend accepts must be let through, with the key bound for tools."""
+        reached = {}
+
+        async def fake_app(scope, receive, send):
+            reached["key"] = _api_key.get()
+
+        with patch("qdt_mcp.server._app", fake_app):
+            async_to_sync(_call_app)([(b"x-api-key", b"GOOD-KEY")], key_valid=True)
+
+        self.assertEqual(reached["key"], "GOOD-KEY")
 
     def test_api_key_is_forwarded_verbatim(self):
         """Tools must pass the caller's key through so trmm applies their permissions."""
