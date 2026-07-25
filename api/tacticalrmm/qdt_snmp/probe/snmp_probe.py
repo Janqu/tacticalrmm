@@ -353,6 +353,7 @@ DUMP_TREES = {
     "printer.marker": "1.3.6.1.2.1.43.10.2.1",
     "printer.supplies": "1.3.6.1.2.1.43.11.1.1",
     "printer.colorant": "1.3.6.1.2.1.43.12.1.1",
+    "printer.input": "1.3.6.1.2.1.43.8.2.1",
     "host.device": "1.3.6.1.2.1.25.3.2.1",
     "ups": "1.3.6.1.2.1.33",
 }
@@ -369,6 +370,44 @@ SUPPLY_MAX_COL = "1.3.6.1.2.1.43.11.1.1.8.1."
 SUPPLY_LEVEL_COL = "1.3.6.1.2.1.43.11.1.1.9.1."
 SUPPLY_COLORANT_COL = "1.3.6.1.2.1.43.11.1.1.3.1."
 COLORANT_VALUE_COL = "1.3.6.1.2.1.43.12.1.1.4.1."
+
+# prtInput: paper trays
+INPUT_MAX_COL = "1.3.6.1.2.1.43.8.2.1.9.1."
+INPUT_LEVEL_COL = "1.3.6.1.2.1.43.8.2.1.10.1."
+INPUT_NAME_COL = "1.3.6.1.2.1.43.8.2.1.13.1."
+INPUT_MEDIA_COL = "1.3.6.1.2.1.43.8.2.1.12.1."
+INPUT_DESC_COL = "1.3.6.1.2.1.43.8.2.1.18.1."
+
+
+def decode_trays(trees: dict) -> list:
+    """Paper trays from prtInput. Same sentinel rules as supplies: a negative level
+    means unknown or "capacity not reported", not an empty tray."""
+    tree = trees.get("printer.input", {})
+    indices = sorted(
+        {int(oid[len(INPUT_LEVEL_COL) :]) for oid in tree if oid.startswith(INPUT_LEVEL_COL)}
+    )
+
+    out = []
+    for i in indices:
+        level = tree.get(f"{INPUT_LEVEL_COL}{i}")
+        maximum = tree.get(f"{INPUT_MAX_COL}{i}")
+        name = tree.get(f"{INPUT_NAME_COL}{i}") or tree.get(f"{INPUT_DESC_COL}{i}")
+        out.append({
+            "index": i,
+            "name": name or f"Schacht {i}",
+            "media": tree.get(f"{INPUT_MEDIA_COL}{i}"),
+            "level": level,
+            "max": maximum,
+            "percent": (
+                round(level / maximum * 100, 1)
+                if isinstance(level, int) and isinstance(maximum, int) and maximum > 0 and level >= 0
+                else None
+            ),
+            "suggested_metric": f"tray.{_slug(name) if name else i}",
+            "level_oid": f"{INPUT_LEVEL_COL}{i}",
+            "max_oid": f"{INPUT_MAX_COL}{i}",
+        })
+    return out
 
 
 def decode_supplies(trees: dict) -> list:
@@ -412,14 +451,14 @@ def decode_supplies(trees: dict) -> list:
     return out
 
 
-def suggest_metric_map(trees: dict, supplies: list) -> dict:
+def suggest_metric_map(trees: dict, supplies: list, trays: list = ()) -> dict:
     """A starting point, not a verdict. Only percentages that actually computed."""
     suggestion = {}
-    for supply in supplies:
-        if supply["percent"] is not None:
-            suggestion[supply["suggested_metric"]] = {
-                "oid": supply["level_oid"],
-                "max_oid": supply["max_oid"],
+    for entry in list(supplies) + list(trays):
+        if entry["percent"] is not None:
+            suggestion[entry["suggested_metric"]] = {
+                "oid": entry["level_oid"],
+                "max_oid": entry["max_oid"],
             }
     if PRT_PAGES in trees.get("printer.marker", {}):
         suggestion["pages.total"] = {"oid": PRT_PAGES}
@@ -440,12 +479,14 @@ def dump(host, port, community, timeout, retries) -> dict:
             trees[label] = found
 
     supplies = decode_supplies(trees)
+    trays = decode_trays(trees)
     return {
         "host": host,
         "port": port,
         "sys_descr": trees.get("system", {}).get(SYS_DESCR),
         "supplies": supplies,
-        "suggested_metric_map": suggest_metric_map(trees, supplies),
+        "trays": trays,
+        "suggested_metric_map": suggest_metric_map(trees, supplies, trays),
         "raw": trees,
     }
 
@@ -613,9 +654,29 @@ def selftest() -> int:
     assert supplies[0]["suggested_metric"] == "supply.black", supplies[0]
     assert supplies[1]["percent"] is None, "sentinel levels must not produce a percentage"
 
-    suggestion = suggest_metric_map(trees, supplies)
-    assert set(suggestion) == {"supply.black", "pages.total", "uptime.seconds"}, suggestion
+    # paper trays decode from prtInput with the same sentinel rules
+    trees["printer.input"] = {
+        f"{INPUT_NAME_COL}1": "Tray 1",
+        f"{INPUT_MAX_COL}1": 500,
+        f"{INPUT_LEVEL_COL}1": 125,
+        f"{INPUT_MEDIA_COL}1": "A4",
+        f"{INPUT_NAME_COL}2": "Manual Feed",
+        f"{INPUT_MAX_COL}2": -2,
+        f"{INPUT_LEVEL_COL}2": -3,
+    }
+    trays = decode_trays(trees)
+    assert [t["name"] for t in trays] == ["Tray 1", "Manual Feed"], trays
+    assert trays[0]["percent"] == 25.0, trays[0]
+    assert trays[0]["media"] == "A4"
+    assert trays[0]["suggested_metric"] == "tray.tray_1", trays[0]
+    assert trays[1]["percent"] is None, "a manual feed reports no usable capacity"
+
+    suggestion = suggest_metric_map(trees, supplies, trays)
+    assert set(suggestion) == {
+        "supply.black", "tray.tray_1", "pages.total", "uptime.seconds"
+    }, suggestion
     assert "supply.wartungskit" not in suggestion
+    assert "tray.manual_feed" not in suggestion
 
     # the map poller must apply max_oid as a percentage and scale as a factor
     sample = {
