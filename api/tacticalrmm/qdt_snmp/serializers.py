@@ -1,8 +1,40 @@
+import re
+
 from rest_framework import serializers
 
 from core.serializers import mask_token
 
 from .models import SnmpDevice, SnmpReading
+
+OID_RE = re.compile(r"^\d+(\.\d+)+$")
+ALLOWED_MAP_KEYS = {"oid", "max_oid", "scale"}
+
+
+def validate_metric_map(value):
+    """Garbage here would silently produce wrong readings, so reject it at the door."""
+    if not value:
+        return {}
+    if not isinstance(value, dict):
+        raise serializers.ValidationError("metric_map must be an object")
+
+    for metric, spec in value.items():
+        if not isinstance(spec, dict):
+            raise serializers.ValidationError(f"{metric}: entry must be an object")
+
+        unknown = set(spec) - ALLOWED_MAP_KEYS
+        if unknown:
+            raise serializers.ValidationError(
+                f"{metric}: unknown keys {sorted(unknown)}, allowed are {sorted(ALLOWED_MAP_KEYS)}"
+            )
+        for key in ("oid", "max_oid"):
+            if key in spec and not OID_RE.match(str(spec[key])):
+                raise serializers.ValidationError(f"{metric}: {key} is not a dotted OID")
+        if "oid" not in spec:
+            raise serializers.ValidationError(f"{metric}: oid is required")
+        if "scale" in spec and not isinstance(spec["scale"], (int, float)):
+            raise serializers.ValidationError(f"{metric}: scale must be a number")
+
+    return value
 
 
 class SnmpDeviceSerializer(serializers.ModelSerializer):
@@ -28,6 +60,7 @@ class SnmpDeviceSerializer(serializers.ModelSerializer):
             "enabled",
             "description",
             "offline_minutes",
+            "metric_map",
             "model_name",
             "serial",
             "last_seen",
@@ -35,6 +68,9 @@ class SnmpDeviceSerializer(serializers.ModelSerializer):
             "status",
         )
         read_only_fields = ("model_name", "serial", "last_seen", "last_error")
+
+    def validate_metric_map(self, value):
+        return validate_metric_map(value)
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
@@ -54,7 +90,7 @@ class SnmpProbeDeviceSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = SnmpDevice
-        fields = ("id", "name", "device_type", "ip", "port", "community")
+        fields = ("id", "name", "device_type", "ip", "port", "community", "metric_map")
 
 
 class SnmpReadingSerializer(serializers.ModelSerializer):

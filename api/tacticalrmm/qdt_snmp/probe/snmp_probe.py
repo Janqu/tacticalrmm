@@ -11,7 +11,18 @@ readings back. Standard library only on purpose: the agent ships a bare Python w
 no third party packages, and shipping a net-snmp binary to every probe is not worth
 it for what amounts to a few UDP round trips.
 
-Run with --selftest to check the BER codec without touching the network.
+A device row may carry a metric_map saying which OID to report under which name; if
+it does, that is used verbatim. Otherwise the built-in profile for the device type
+applies. Printers vary enough between vendors that guessing in code does not work.
+
+To work out the map for a new model, run it against one device without a server:
+
+    --dump 192.168.10.50 [--community public] [--port 161]
+
+That walks the relevant subtrees and prints json: the decoded supplies with their
+colorant and fill level, a suggested metric_map, and the raw OIDs behind it.
+
+Run with --selftest to check the codec and the decoding without a network.
 """
 
 import argparse
@@ -31,6 +42,7 @@ OCTET_STRING = 0x04
 NULL = 0x05
 OID = 0x06
 GET_REQUEST = 0xA0
+GET_NEXT_REQUEST = 0xA1
 GET_RESPONSE = 0xA2
 
 # SNMPv2c "this OID does not exist here" markers, returned in place of a value
@@ -110,10 +122,10 @@ def _decode_value(tag: int, body: bytes):
     return body.hex()
 
 
-def build_get(community: str, oids, request_id: int) -> bytes:
+def build_get(community: str, oids, request_id: int, pdu_tag: int = GET_REQUEST) -> bytes:
     varbinds = b"".join(_tlv(SEQUENCE, _enc_oid(o) + _tlv(NULL, b"")) for o in oids)
     pdu = _tlv(
-        GET_REQUEST,
+        pdu_tag,
         _enc_int(request_id)
         + _enc_int(0)  # error-status
         + _enc_int(0)  # error-index
@@ -169,8 +181,8 @@ def _oid_to_str(body: bytes) -> str:
     return ".".join(str(p) for p in parts)
 
 
-def snmp_get(host: str, port: int, community: str, oids, timeout=2.0, retries=1) -> dict:
-    request = build_get(community, oids, request_id=1)
+def _exchange(host, port, community, oids, timeout, retries, pdu_tag) -> dict:
+    request = build_get(community, oids, request_id=1, pdu_tag=pdu_tag)
     last_error = None
     for _ in range(retries + 1):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -184,6 +196,30 @@ def snmp_get(host: str, port: int, community: str, oids, timeout=2.0, retries=1)
         finally:
             sock.close()
     raise TimeoutError(str(last_error) if last_error else "no response")
+
+
+def snmp_get(host: str, port: int, community: str, oids, timeout=2.0, retries=1) -> dict:
+    return _exchange(host, port, community, oids, timeout, retries, GET_REQUEST)
+
+
+def snmp_walk(host, port, community, root: str, timeout=2.0, retries=1, limit=200) -> dict:
+    """GETNEXT down a subtree. Used by --dump; the scheduled poll stays GET only."""
+    prefix = root.rstrip(".") + "."
+    current = root
+    out = {}
+
+    for _ in range(limit):
+        reply = _exchange(host, port, community, [current], timeout, retries, GET_NEXT_REQUEST)
+        if not reply:
+            break
+        # exactly one varbind comes back for a single-OID GETNEXT
+        next_oid, value = next(iter(reply.items()))
+        if not next_oid.startswith(prefix) or next_oid in out:
+            break
+        out[next_oid] = value
+        current = next_oid
+
+    return out
 
 
 # ------------------------------------------------------------------ OID sets
@@ -277,6 +313,143 @@ def poll_generic(host, port, community, timeout, retries) -> tuple:
 POLLERS = {"printer": poll_printer, "ups": poll_ups}
 
 
+def poll_from_map(host, port, community, metric_map, timeout, retries) -> tuple:
+    """Poll exactly what the device row says to poll.
+
+    Preferred over the built-in profiles: vendors disagree about how the printer MIB
+    should be filled in, so the mapping belongs on the device where --dump and a human
+    (or an assistant) can get it right per model instead of being guessed in code.
+    """
+    wanted = [SYS_DESCR]
+    for spec in metric_map.values():
+        wanted.append(spec["oid"])
+        if spec.get("max_oid"):
+            wanted.append(spec["max_oid"])
+
+    data = snmp_get(host, port, community, sorted(set(wanted)), timeout, retries)
+
+    metrics = {}
+    for metric, spec in metric_map.items():
+        raw = data.get(spec["oid"])
+        if raw is None or isinstance(raw, str):
+            continue
+        if spec.get("max_oid"):
+            maximum = data.get(spec["max_oid"])
+            if not isinstance(maximum, (int, float)) or maximum <= 0 or raw < 0:
+                continue
+            metrics[metric] = round(raw / maximum * 100, 1)
+        else:
+            metrics[metric] = round(float(raw) * float(spec.get("scale", 1)), 2)
+
+    return data.get(SYS_DESCR), None, metrics
+
+
+# ------------------------------------------------------------------ discovery
+
+# subtrees worth showing when working out what a device actually exposes
+DUMP_TREES = {
+    "system": "1.3.6.1.2.1.1",
+    "printer.general": "1.3.6.1.2.1.43.5.1.1",
+    "printer.marker": "1.3.6.1.2.1.43.10.2.1",
+    "printer.supplies": "1.3.6.1.2.1.43.11.1.1",
+    "printer.colorant": "1.3.6.1.2.1.43.12.1.1",
+    "host.device": "1.3.6.1.2.1.25.3.2.1",
+    "ups": "1.3.6.1.2.1.33",
+}
+
+SUPPLY_TYPES = {
+    1: "other", 2: "unknown", 3: "toner", 4: "wasteToner", 5: "ink",
+    6: "inkCartridge", 7: "inkRibbon", 8: "wasteInk", 9: "opc", 10: "developer",
+    11: "fuserOil", 12: "solidWax", 13: "ribbonWax", 14: "wasteWax", 15: "fuser",
+}
+
+SUPPLY_DESC_COL = "1.3.6.1.2.1.43.11.1.1.6.1."
+SUPPLY_TYPE_COL = "1.3.6.1.2.1.43.11.1.1.5.1."
+SUPPLY_MAX_COL = "1.3.6.1.2.1.43.11.1.1.8.1."
+SUPPLY_LEVEL_COL = "1.3.6.1.2.1.43.11.1.1.9.1."
+SUPPLY_COLORANT_COL = "1.3.6.1.2.1.43.11.1.1.3.1."
+COLORANT_VALUE_COL = "1.3.6.1.2.1.43.12.1.1.4.1."
+
+
+def decode_supplies(trees: dict) -> list:
+    """Turn the raw supplies and colorant tables into something readable.
+
+    Done here rather than left to the reader: the standard part of the MIB is
+    unambiguous, so decoding it locally shrinks what anyone downstream has to guess.
+    """
+    supplies_tree = trees.get("printer.supplies", {})
+    colorant_tree = trees.get("printer.colorant", {})
+
+    indices = sorted(
+        {int(oid[len(SUPPLY_LEVEL_COL) :]) for oid in supplies_tree if oid.startswith(SUPPLY_LEVEL_COL)}
+    )
+
+    out = []
+    for i in indices:
+        colorant_idx = supplies_tree.get(f"{SUPPLY_COLORANT_COL}{i}")
+        colour = colorant_tree.get(f"{COLORANT_VALUE_COL}{colorant_idx}") if colorant_idx else None
+        type_code = supplies_tree.get(f"{SUPPLY_TYPE_COL}{i}")
+        level = supplies_tree.get(f"{SUPPLY_LEVEL_COL}{i}")
+        maximum = supplies_tree.get(f"{SUPPLY_MAX_COL}{i}")
+
+        name = _slug(colour) if colour else _slug(supplies_tree.get(f"{SUPPLY_DESC_COL}{i}", ""))
+        out.append({
+            "index": i,
+            "description": supplies_tree.get(f"{SUPPLY_DESC_COL}{i}"),
+            "colorant": colour,
+            "type": SUPPLY_TYPES.get(type_code, type_code),
+            "level": level,
+            "max": maximum,
+            "percent": (
+                round(level / maximum * 100, 1)
+                if isinstance(level, int) and isinstance(maximum, int) and maximum > 0 and level >= 0
+                else None
+            ),
+            "suggested_metric": f"supply.{name}",
+            "level_oid": f"{SUPPLY_LEVEL_COL}{i}",
+            "max_oid": f"{SUPPLY_MAX_COL}{i}",
+        })
+    return out
+
+
+def suggest_metric_map(trees: dict, supplies: list) -> dict:
+    """A starting point, not a verdict. Only percentages that actually computed."""
+    suggestion = {}
+    for supply in supplies:
+        if supply["percent"] is not None:
+            suggestion[supply["suggested_metric"]] = {
+                "oid": supply["level_oid"],
+                "max_oid": supply["max_oid"],
+            }
+    if PRT_PAGES in trees.get("printer.marker", {}):
+        suggestion["pages.total"] = {"oid": PRT_PAGES}
+    if SYS_UPTIME in trees.get("system", {}):
+        suggestion["uptime.seconds"] = {"oid": SYS_UPTIME, "scale": 0.01}
+    return suggestion
+
+
+def dump(host, port, community, timeout, retries) -> dict:
+    trees = {}
+    for label, root in DUMP_TREES.items():
+        try:
+            found = snmp_walk(host, port, community, root, timeout, retries)
+        except Exception as err:
+            trees[label] = {"error": str(err)}
+            continue
+        if found:
+            trees[label] = found
+
+    supplies = decode_supplies(trees)
+    return {
+        "host": host,
+        "port": port,
+        "sys_descr": trees.get("system", {}).get(SYS_DESCR),
+        "supplies": supplies,
+        "suggested_metric_map": suggest_metric_map(trees, supplies),
+        "raw": trees,
+    }
+
+
 # ---------------------------------------------------------------------- main
 
 
@@ -295,13 +468,32 @@ def _http(url: str, api_key: str, payload=None, insecure=False):
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--url", required=True, help="https://api.example.com")
-    parser.add_argument("--agent-id", required=True)
-    parser.add_argument("--api-key", required=True)
+    parser.add_argument("--url", help="https://api.example.com")
+    parser.add_argument("--agent-id")
+    parser.add_argument("--api-key")
     parser.add_argument("--timeout", type=float, default=2.0)
     parser.add_argument("--retries", type=int, default=1)
     parser.add_argument("--insecure", action="store_true", help="self signed cert")
+    parser.add_argument(
+        "--dump",
+        metavar="IP",
+        help="walk one device and print what it exposes as json, then exit. "
+        "Needs no server, use it to work out a metric_map for a new model.",
+    )
+    parser.add_argument("--community", default="public", help="only with --dump")
+    parser.add_argument("--port", type=int, default=161, help="only with --dump")
     args = parser.parse_args()
+
+    if args.dump:
+        print(json.dumps(
+            dump(args.dump, args.port, args.community, args.timeout, args.retries),
+            indent=2, ensure_ascii=False,
+        ))
+        return 0
+
+    missing = [n for n in ("url", "agent_id", "api_key") if not getattr(args, n)]
+    if missing:
+        parser.error(f"missing required arguments: {', '.join('--' + m.replace('_', '-') for m in missing)}")
 
     endpoint = f"{args.url.rstrip('/')}/qdt_snmp/probe/{args.agent_id}/devices/"
 
@@ -320,12 +512,19 @@ def main() -> int:
 
     results, unreachable = [], 0
     for device in devices:
-        poller = POLLERS.get(device["device_type"], poll_generic)
+        metric_map = device.get("metric_map") or {}
         try:
-            descr, serial, metrics = poller(
-                device["ip"], device["port"], device["community"],
-                args.timeout, args.retries,
-            )
+            if metric_map:
+                descr, serial, metrics = poll_from_map(
+                    device["ip"], device["port"], device["community"],
+                    metric_map, args.timeout, args.retries,
+                )
+            else:
+                poller = POLLERS.get(device["device_type"], poll_generic)
+                descr, serial, metrics = poller(
+                    device["ip"], device["port"], device["community"],
+                    args.timeout, args.retries,
+                )
             results.append({
                 "id": device["id"],
                 "reachable": True,
@@ -378,6 +577,63 @@ def selftest() -> int:
 
     assert _slug("Black Toner Cartridge") == "black_toner_cartridge"
     assert _slug("") == "supply"
+
+    # getnext uses a different pdu tag but the same envelope
+    walk_req = build_get("public", [SYS_DESCR], request_id=1, pdu_tag=GET_NEXT_REQUEST)
+    _, msg, _ = _read_tlv(walk_req, 0)
+    pos = 0
+    _, _, pos = _read_tlv(msg, pos)
+    _, _, pos = _read_tlv(msg, pos)
+    assert msg[pos] == GET_NEXT_REQUEST, "walk must send GETNEXT, not GET"
+
+    # supplies and colorant tables must decode into named, percentaged entries
+    trees = {
+        "printer.supplies": {
+            f"{SUPPLY_DESC_COL}1": "HP 59A Black Cartridge",
+            f"{SUPPLY_TYPE_COL}1": 3,
+            f"{SUPPLY_MAX_COL}1": 3000,
+            f"{SUPPLY_LEVEL_COL}1": 750,
+            f"{SUPPLY_COLORANT_COL}1": 1,
+            # a level of -2 means "no restriction", it must not become a reading
+            f"{SUPPLY_DESC_COL}2": "Wartungskit",
+            f"{SUPPLY_TYPE_COL}2": 15,
+            f"{SUPPLY_MAX_COL}2": -2,
+            f"{SUPPLY_LEVEL_COL}2": -2,
+        },
+        "printer.colorant": {f"{COLORANT_VALUE_COL}1": "black"},
+        "printer.marker": {PRT_PAGES: 15234},
+        "system": {SYS_UPTIME: 900},
+    }
+    supplies = decode_supplies(trees)
+    assert [s["index"] for s in supplies] == [1, 2], supplies
+    assert supplies[0]["colorant"] == "black"
+    assert supplies[0]["type"] == "toner"
+    assert supplies[0]["percent"] == 25.0, supplies[0]
+    # the colorant table wins over the vendor's description string
+    assert supplies[0]["suggested_metric"] == "supply.black", supplies[0]
+    assert supplies[1]["percent"] is None, "sentinel levels must not produce a percentage"
+
+    suggestion = suggest_metric_map(trees, supplies)
+    assert set(suggestion) == {"supply.black", "pages.total", "uptime.seconds"}, suggestion
+    assert "supply.wartungskit" not in suggestion
+
+    # the map poller must apply max_oid as a percentage and scale as a factor
+    sample = {
+        SYS_DESCR: "HP LaserJet",
+        "1.3.6.1.2.1.43.11.1.1.9.1.1": 750,
+        "1.3.6.1.2.1.43.11.1.1.8.1.1": 3000,
+        SYS_UPTIME: 900,
+    }
+    original_get = globals()["snmp_get"]
+    globals()["snmp_get"] = lambda *a, **k: sample
+    try:
+        _, _, metrics = poll_from_map("x", 161, "public", suggestion, 1, 0)
+    finally:
+        globals()["snmp_get"] = original_get
+    assert metrics["supply.black"] == 25.0, metrics
+    assert metrics["uptime.seconds"] == 9.0, metrics
+    assert "pages.total" not in metrics, "an OID the device did not answer must be skipped"
+
     print("selftest ok")
     return 0
 

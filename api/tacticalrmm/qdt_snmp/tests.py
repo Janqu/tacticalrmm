@@ -114,6 +114,62 @@ class TestSnmpDevices(TacticalTestCase):
         self.assertEqual(self.printer_a.name, "Drucker A neu")
 
 
+class TestMetricMapValidation(TacticalTestCase):
+    """A bad map would not fail loudly, it would quietly produce wrong readings."""
+
+    def setUp(self):
+        self.setup_coresettings()
+        self.authenticate()
+        self.site = baker.make("clients.Site")
+
+    def _post(self, metric_map):
+        return self.client.post(
+            f"{BASE}/devices/",
+            {
+                "site": self.site.pk,
+                "name": "Drucker",
+                "ip": "10.0.0.1",
+                "metric_map": metric_map,
+            },
+            format="json",
+        )
+
+    def test_valid_map_is_accepted_and_reaches_the_probe(self):
+        good = {
+            "supply.black": {
+                "oid": "1.3.6.1.2.1.43.11.1.1.9.1.1",
+                "max_oid": "1.3.6.1.2.1.43.11.1.1.8.1.1",
+            },
+            "uptime.seconds": {"oid": "1.3.6.1.2.1.1.3.0", "scale": 0.01},
+        }
+        r = self._post(good)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(SnmpDevice.objects.get(pk=r.data["id"]).metric_map, good)
+
+        agent = baker.make_recipe("agents.agent", site=self.site)
+        r = self.client.get(f"{BASE}/probe/{agent.agent_id}/devices/")
+        self.assertEqual(r.data[0]["metric_map"], good)
+
+    def test_bad_maps_are_rejected(self):
+        cases = {
+            "not an object": [1, 2],
+            "entry not an object": {"a": "1.2.3"},
+            "missing oid": {"a": {"scale": 2}},
+            "oid is not an oid": {"a": {"oid": "sysDescr"}},
+            "max_oid is not an oid": {"a": {"oid": "1.3.6", "max_oid": "nope"}},
+            "scale not numeric": {"a": {"oid": "1.3.6", "scale": "zwei"}},
+            "unknown key": {"a": {"oid": "1.3.6", "multiply": 2}},
+        }
+        for label, bad in cases.items():
+            with self.subTest(case=label):
+                self.assertEqual(self._post(bad).status_code, 400)
+
+    def test_empty_map_is_allowed_and_means_use_the_builtin_profile(self):
+        r = self._post({})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(SnmpDevice.objects.get(pk=r.data["id"]).metric_map, {})
+
+
 class TestSnmpProbe(TacticalTestCase):
     def setUp(self):
         self.setup_coresettings()

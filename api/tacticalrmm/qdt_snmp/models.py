@@ -75,6 +75,13 @@ class SnmpDevice(models.Model):
     # how long without a successful poll before the device counts as offline
     offline_minutes = models.PositiveIntegerField(default=30)
 
+    # {"supply.black": {"oid": "1.3...9.1.1", "max_oid": "1.3...8.1.1"},
+    #  "uptime.seconds": {"oid": "1.3.6.1.2.1.1.3.0", "scale": 0.01}}
+    # Empty means the probe falls back to the built-in profile for device_type.
+    # Printers differ enough between vendors that hardcoding every quirk is hopeless,
+    # so the mapping lives on the device where discovery can write it.
+    metric_map = models.JSONField(default=dict, blank=True)
+
     # filled in by the probe
     model_name = models.CharField(max_length=255, null=True, blank=True)
     serial = models.CharField(max_length=255, null=True, blank=True)
