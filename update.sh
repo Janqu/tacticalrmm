@@ -70,6 +70,31 @@ cls() {
   printf "\033c"
 }
 
+# qdt: route /mcp to the asgi process for the mcp server. Runs unconditionally because
+# the rmm.conf rewrite below drops any custom location; the include is idempotent.
+qdt_install_mcp_nginx() {
+  local conf='/etc/nginx/sites-available/rmm.conf'
+
+  sudo mkdir -p /etc/nginx/snippets
+  sudo tee /etc/nginx/snippets/trmm-mcp.conf >/dev/null <<'MCPEOF'
+location ~ ^/mcp {
+    proxy_pass http://unix:/rmm/daphne.sock;
+    proxy_http_version 1.1;
+    # long running commands; must match API_TIMEOUT in qdt_mcp/server.py
+    proxy_read_timeout 300s;
+    proxy_redirect     off;
+    proxy_set_header   Host $host;
+    proxy_set_header   X-Real-IP $remote_addr;
+    proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Forwarded-Proto $scheme;
+}
+MCPEOF
+
+  if [ -f "$conf" ] && ! grep -q 'snippets/trmm-mcp.conf' "$conf"; then
+    sudo sed -i '/location ~ \^\/ws\/ {/i include /etc/nginx/snippets/trmm-mcp.conf;' "$conf"
+  fi
+}
+
 if [ ! -d /etc/apt/keyrings ]; then
   sudo mkdir -p /etc/apt/keyrings
 fi
@@ -651,6 +676,8 @@ EOF
   )"
   echo "${nginxrmm}" | sudo tee /etc/nginx/sites-available/rmm.conf >/dev/null
 fi
+
+qdt_install_mcp_nginx
 
 for i in rmm frontend meshcentral; do
   conf="/etc/nginx/sites-enabled/${i}.conf"

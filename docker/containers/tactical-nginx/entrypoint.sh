@@ -98,6 +98,21 @@ server  {
         alias ${TACTICAL_DIR}/api/tacticalrmm/private/;
     }
 
+    location ~ ^/mcp {
+        set \$mcp http://${WEBSOCKETS_SERVICE}:8383;
+        proxy_pass \$mcp;
+
+        proxy_http_version 1.1;
+        # long running commands; must match API_TIMEOUT in qdt_mcp/server.py
+        proxy_read_timeout 300s;
+
+        proxy_redirect     off;
+        proxy_set_header   Host \$host;
+        proxy_set_header   X-Real-IP \$remote_addr;
+        proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+    }
+
     location ~ ^/ws/ {
         set \$api http://${WEBSOCKETS_SERVICE}:8383;
         proxy_pass \$api;
