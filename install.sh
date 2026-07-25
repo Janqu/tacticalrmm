@@ -150,8 +150,10 @@ print_yellow() {
 # qdt: route /mcp to the asgi process for the mcp server. The block lives in its own
 # snippet and rmm.conf only gets a one line include, so re-adding it after update.sh
 # rewrites rmm.conf wholesale is a single idempotent sed.
+# Patches sites-enabled too: it is normally a symlink, but on installs where it is a
+# real copy, editing only sites-available silently does nothing and /mcp 404s.
 qdt_install_mcp_nginx() {
-  local conf='/etc/nginx/sites-available/rmm.conf'
+  local conf
 
   sudo mkdir -p /etc/nginx/snippets
   sudo tee /etc/nginx/snippets/trmm-mcp.conf >/dev/null <<'MCPEOF'
@@ -168,9 +170,12 @@ location ~ ^/mcp {
 }
 MCPEOF
 
-  if [ -f "$conf" ] && ! grep -q 'snippets/trmm-mcp.conf' "$conf"; then
-    sudo sed -i '/location ~ \^\/ws\/ {/i include /etc/nginx/snippets/trmm-mcp.conf;' "$conf"
-  fi
+  for conf in /etc/nginx/sites-available/rmm.conf /etc/nginx/sites-enabled/rmm.conf; do
+    # skip the symlink case so we don't patch the same file twice
+    if [ -f "$conf" ] && [ ! -L "$conf" ] && ! grep -q 'snippets/trmm-mcp.conf' "$conf"; then
+      sudo sed -i '/location ~ \^\/ws\/ {/i include /etc/nginx/snippets/trmm-mcp.conf;' "$conf"
+    fi
+  done
 }
 
 cls
