@@ -9,6 +9,8 @@ dashboard websocket, so a blocking call would freeze the UI for its whole durati
 """
 
 import contextvars
+import json
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -27,6 +29,12 @@ API_URL = get_backend_url(
 VERIFY_SSL = getattr(settings, "MCP_VERIFY_SSL", True)
 # must stay <= the proxy_read_timeout on nginx's /mcp location
 API_TIMEOUT = 300.0
+
+# shipped to the probe agent by discover_snmp_device, so discovery always runs the
+# same code as the scheduled poll rather than a copy that can drift
+_PROBE_SCRIPT = (
+    Path(__file__).resolve().parent.parent / "qdt_snmp" / "probe" / "snmp_probe.py"
+)
 
 _api_key: contextvars.ContextVar[str] = contextvars.ContextVar("trmm_api_key")
 
@@ -50,7 +58,10 @@ mcp = FastMCP(
         "Analyze and manage devices in Tactical RMM. Identify a device with "
         "list_agents first, then use its agent_id with the other tools. Read the "
         "device state before changing it, and note that shell/script syntax depends "
-        "on the agent's 'plat' field (windows, linux or darwin)."
+        "on the agent's 'plat' field (windows, linux or darwin).\n\n"
+        "SNMP devices (printers, UPS, switches) are separate: they run no agent and "
+        "are polled by an agent at the same site. They have a numeric device_id, not "
+        "an agent_id, and live under the list_snmp_devices / get_snmp_readings tools."
     ),
     stateless_http=True,
     json_response=True,
@@ -144,6 +155,51 @@ async def list_alerts(
         )
         for a in alerts[:limit]
     ]
+
+
+@mcp.tool(annotations=READ)
+async def list_snmp_devices(client_id: int | None = None) -> list[dict]:
+    """List SNMP devices (printers, UPS, switches) with their status and last contact.
+
+    These have no agent; an agent at the same site polls them. last_error tells you
+    why a device is not answering.
+    """
+    params = {"client": client_id} if client_id is not None else {}
+    devices = await _api("GET", "/qdt_snmp/devices/", params=params)
+    return [
+        _pick(
+            d,
+            "id",
+            "name",
+            "device_type",
+            "ip",
+            "site",
+            "site_name",
+            "client_name",
+            "status",
+            "enabled",
+            "model_name",
+            "serial",
+            "last_seen",
+            "last_error",
+            "metric_map",
+        )
+        for d in devices
+    ]
+
+
+@mcp.tool(annotations=READ)
+async def get_snmp_readings(
+    device_id: int, metric: str | None = None, days: int = 7
+) -> Any:
+    """Read the measurement history of an SNMP device, for trends like toner over time.
+
+    Omit metric to get every metric the device reports.
+    """
+    params: dict[str, Any] = {"days": days}
+    if metric:
+        params["metric"] = metric
+    return await _api("GET", f"/qdt_snmp/devices/{device_id}/readings/", params=params)
 
 
 @mcp.tool(annotations=READ)
@@ -493,6 +549,109 @@ async def run_script_code(
 
 
 @mcp.tool(annotations=WRITE)
+async def create_snmp_device(
+    site_id: int,
+    name: str,
+    ip: str,
+    device_type: str = "printer",
+    community: str = "public",
+    port: int = 161,
+    metric_map: dict | None = None,
+    description: str = "",
+) -> Any:
+    """Register an SNMP device (printer, UPS, switch) at a site.
+
+    device_type is "printer", "ups", "switch", "firewall", "nas" or "other". Get
+    site_id from list_clients. Run discover_snmp_device first and base metric_map on
+    its suggestion rather than inventing OIDs; leaving metric_map empty falls back to
+    a generic profile that works but may miss vendor specific supplies.
+    """
+    return await _api(
+        "POST",
+        "/qdt_snmp/devices/",
+        json={
+            "site": site_id,
+            "name": name,
+            "ip": ip,
+            "device_type": device_type,
+            "community": community,
+            "port": port,
+            "metric_map": metric_map or {},
+            "description": description,
+        },
+    )
+
+
+@mcp.tool(annotations=WRITE)
+async def update_snmp_device(
+    device_id: int,
+    name: str | None = None,
+    device_type: str | None = None,
+    ip: str | None = None,
+    port: int | None = None,
+    community: str | None = None,
+    enabled: bool | None = None,
+    description: str | None = None,
+    offline_minutes: int | None = None,
+    metric_map: dict | None = None,
+) -> Any:
+    """Change an SNMP device. Only the fields you pass are touched.
+
+    Mainly for correcting a metric_map after discovery. Note that metric_map is
+    replaced wholesale, not merged, so send the complete map.
+    """
+    fields = {
+        key: value
+        for key, value in {
+            "name": name,
+            "device_type": device_type,
+            "ip": ip,
+            "port": port,
+            "community": community,
+            "enabled": enabled,
+            "description": description,
+            "offline_minutes": offline_minutes,
+            "metric_map": metric_map,
+        }.items()
+        if value is not None
+    }
+    if not fields:
+        raise RuntimeError("nothing to update: pass at least one field")
+
+    return await _api("PUT", f"/qdt_snmp/devices/{device_id}/", json=fields)
+
+
+@mcp.tool(annotations=WRITE)
+async def discover_snmp_device(
+    agent_id: str, ip: str, community: str = "public", port: int = 161
+) -> Any:
+    """Walk an SNMP device from a probe agent and report what it actually exposes.
+
+    Run this before create_snmp_device for any model you have not seen. agent_id must
+    be an online agent on the same network as the device. Returns the decoded supplies
+    with their colorant and fill level, a suggested metric_map, and the raw OIDs.
+
+    Treat the suggestion as a starting point: check that each supply's percentage is
+    plausible against what the device's own display shows before relying on it.
+    """
+    script = _PROBE_SCRIPT.read_text()
+    result = await run_script_code(
+        agent_id=agent_id,
+        code=script,
+        shell="python",
+        args=["--dump", ip, "--community", community, "--port", str(port)],
+        timeout=120,
+    )
+    # the tool returns the agent's raw result; surface stdout as parsed json when we can
+    if isinstance(result, dict) and result.get("stdout"):
+        try:
+            return json.loads(result["stdout"])
+        except ValueError:
+            pass
+    return result
+
+
+@mcp.tool(annotations=WRITE)
 async def kill_process(agent_id: str, pid: int) -> Any:
     """Terminate a process on a device by its pid."""
     return await _api("DELETE", f"/agents/{agent_id}/processes/{pid}/")
@@ -545,6 +704,32 @@ def triage_device(hostname: str) -> str:
         "Then report the most likely cause, the evidence for it, and a concrete "
         "suggested fix. Do not run commands, restart services, kill processes or "
         "reboot anything without asking first."
+    )
+
+
+@mcp.prompt(title="Register an SNMP device")
+def register_snmp_device(ip: str, site_hint: str = "") -> str:
+    """Discover a printer or other SNMP device and register it with a sensible map."""
+    scope = f" It should belong to: {site_hint}." if site_hint else ""
+    return (
+        f"Register the SNMP device at {ip} in Tactical RMM.{scope}\n\n"
+        "1. list_clients to find the client and the site_id, and list_agents to pick "
+        "an online agent at that site to act as the probe. Without one on the same "
+        "network the device cannot be reached at all, so stop and say so.\n"
+        "2. discover_snmp_device with that agent and the ip. If it returns nothing, "
+        "the community string or the ip is wrong; ask rather than guessing.\n"
+        "3. Read the result. Identify the model from sys_descr. For each entry under "
+        "'supplies', decide whether it is a real consumable worth tracking: a level "
+        "of -1, -2 or -3 is a sentinel meaning unknown or unlimited, not a value.\n"
+        "4. Propose a metric_map based on suggested_metric_map. Prefer the colorant "
+        "based names (supply.black, supply.cyan) because they are comparable across "
+        "vendors; only fall back to the description when no colorant is reported. Do "
+        "not invent OIDs that are not in the dump.\n"
+        "5. Show the user the proposed name, type, site and metric_map and let them "
+        "confirm before you call create_snmp_device.\n\n"
+        "Then tell them to compare the first reported fill levels against the "
+        "device's own display, because a plausible looking but wrong OID mapping "
+        "produces numbers that are quietly meaningless."
     )
 
 
