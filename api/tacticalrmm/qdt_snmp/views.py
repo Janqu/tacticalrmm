@@ -91,12 +91,18 @@ class GetAddSnmpDevices(APIView):
         data = SnmpDeviceSerializer(device).data
 
         # the first device at a site sets up its own poller; a failure here must
-        # not break the creation, because e.g. no agent may be online yet
+        # not break the creation, because e.g. no agent may be online yet.
+        # Provisioning schedules code execution on an agent, so it wants the same
+        # permission as running a script.
         if not probe_task_exists(device.site):
+            if not _has_perm(request, "can_run_scripts"):
+                data["probe_warning"] = (
+                    "probe provisioning needs the can_run_scripts permission"
+                )
+                return Response(data)
             try:
                 ensure_probe_for_site(
                     site=device.site,
-                    user=request.user,
                     api_url=request.build_absolute_uri("/"),
                 )
             except NoProbeAgentError as err:
@@ -146,7 +152,10 @@ class DiscoverSnmpDevice(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
+        # this runs code on an agent, so site management alone is not enough -
+        # same bar as the upstream runscript endpoints
         _require(request, WRITE_PERM)
+        _require(request, "can_run_scripts")
 
         site_id = request.data.get("site")
         ip = str(request.data.get("ip") or "").strip()
@@ -171,6 +180,9 @@ class DiscoverSnmpDevice(APIView):
         agent = pick_probe_agent(site_id)
         if agent is None:
             return notify_error("no online agent at this site to probe from")
+        # can_run_scripts is global, so the agent itself still needs a scope check
+        if not _has_perm_on_agent(request.user, agent.agent_id):
+            raise PermissionDenied()
 
         data = {
             "func": "runscriptfull",
@@ -234,10 +246,11 @@ class SiteProbe(APIView):
 
     def post(self, request, site_id):
         site = self._site(request, site_id, WRITE_PERM)
+        # provisioning schedules code execution on an agent
+        _require(request, "can_run_scripts")
         try:
             ensure_probe_for_site(
                 site=site,
-                user=request.user,
                 api_url=request.build_absolute_uri("/"),
             )
         except NoProbeAgentError as err:

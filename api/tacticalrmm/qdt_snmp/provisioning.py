@@ -13,7 +13,7 @@ from pathlib import Path
 from django.utils import timezone as djangotime
 from django.utils.crypto import get_random_string
 
-from accounts.models import APIKey
+from accounts.models import APIKey, Role, User
 from agents.models import Agent
 from autotasks.models import AutomatedTask
 from autotasks.tasks import create_win_task_schedule
@@ -32,6 +32,8 @@ SCRIPT_CATEGORY = "QDT"
 TASK_NAME = "QDT SNMP Poller"
 KEY_STORE_NAME = "snmp_api_key"
 API_KEY_NAME = "snmp-probe"
+SERVICE_USERNAME = "snmp-probe"
+SERVICE_ROLE_NAME = "snmp-probe"
 
 POLL_MINUTES = 5
 TASK_TIMEOUT = 300
@@ -89,22 +91,56 @@ def ensure_script() -> Script:
     return script
 
 
-def ensure_api_key(user) -> None:
+def _service_user():
+    """A dedicated, login-blocked user for the probe key.
+
+    The key only ever calls GET/POST /qdt_snmp/probe/<agent>/devices/, so it gets a
+    role with exactly can_list_sites instead of inheriting the entire permission
+    set of whichever admin happened to provision first. is_active must stay True
+    because the API-key authenticator rejects inactive users; login is blocked by
+    the unusable password and block_dashboard_login instead.
+    """
+    role, _ = Role.objects.get_or_create(
+        name=SERVICE_ROLE_NAME, defaults={"can_list_sites": True}
+    )
+    if not role.can_list_sites:
+        # someone reused the role name; the probe cannot work without this
+        role.can_list_sites = True
+        role.save(update_fields=["can_list_sites"])
+
+    user, created = User.objects.get_or_create(
+        username=SERVICE_USERNAME,
+        defaults={"role": role, "block_dashboard_login": True, "email": ""},
+    )
+    if created:
+        user.set_unusable_password()
+        user.save(update_fields=["password"])
+    return user
+
+
+def ensure_api_key() -> None:
     """The probe authenticates with {{global.snmp_api_key}}.
 
-    When the store entry is missing, a key is created for the calling user - which
-    means the probe inherits that user's permissions, so this wants an admin. The
-    key value itself never leaves the server; it is substituted into the script
-    args server-side on every run.
+    The key value never leaves the server; it is substituted into the script args
+    server-side on every run. get_or_create everywhere so a concurrent first
+    provision degrades to sharing the existing rows instead of failing.
     """
     if GlobalKVStore.objects.filter(name=KEY_STORE_NAME).exists():
         return
 
     api_key, _ = APIKey.objects.get_or_create(
         name=API_KEY_NAME,
-        defaults={"key": get_random_string(length=32).upper(), "user": user},
+        defaults={
+            "key": get_random_string(length=32).upper(),
+            "user": _service_user(),
+        },
     )
-    GlobalKVStore.objects.create(name=KEY_STORE_NAME, value=api_key.key)
+    # no unique constraint on name here (upstream model), so a true race can still
+    # produce a duplicate row; in practice the APIKey get_or_create above funnels
+    # concurrent runs onto the same key
+    GlobalKVStore.objects.get_or_create(
+        name=KEY_STORE_NAME, defaults={"value": api_key.key}
+    )
 
 
 def _task_actions(script: Script, api_url: str) -> list:
@@ -172,8 +208,8 @@ def probe_task_exists(site) -> bool:
     return AutomatedTask.objects.filter(name=TASK_NAME, agent__site=site).exists()
 
 
-def ensure_probe_for_site(*, site, user, api_url: str) -> None:
-    ensure_api_key(user)
+def ensure_probe_for_site(*, site, api_url: str) -> None:
+    ensure_api_key()
     ensure_task(site, ensure_script(), api_url.rstrip("/"))
 
 

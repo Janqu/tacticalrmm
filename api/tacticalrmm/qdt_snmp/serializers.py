@@ -160,3 +160,23 @@ class SnmpIngestSerializer(serializers.Serializer):
     metrics = serializers.DictField(
         child=serializers.FloatField(allow_null=True), required=False
     )
+
+    # a buggy or compromised probe must not be able to 500 the ingest or flood it
+    MAX_METRICS = 64
+    METRIC_NAME_MAX = 100  # matches SnmpReading.metric
+
+    def validate_metrics(self, value):
+        if len(value) > self.MAX_METRICS:
+            raise serializers.ValidationError(
+                f"too many metrics, max {self.MAX_METRICS}"
+            )
+        for metric, reading in value.items():
+            if len(metric) > self.METRIC_NAME_MAX:
+                raise serializers.ValidationError(
+                    f"metric name longer than {self.METRIC_NAME_MAX} chars"
+                )
+            # DRF's json parser accepts NaN/Infinity, and a NaN stored as a reading
+            # breaks the dashboard's json later
+            if reading is not None and not math.isfinite(reading):
+                raise serializers.ValidationError(f"{metric}: value must be finite")
+        return value

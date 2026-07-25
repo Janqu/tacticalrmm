@@ -634,6 +634,12 @@ async def discover_snmp_device(
     Treat the suggestion as a starting point: check that each supply's percentage is
     plausible against what the device's own display shows before relying on it.
     """
+    # the args go through TestScript's server-side {{...}} expansion, so a community
+    # of "{{global.snmp_api_key}}" would exfiltrate the probe key to a chosen host
+    for value in (ip, community):
+        if "{{" in value:
+            raise RuntimeError("template syntax ({{...}}) is not allowed in ip or community")
+
     script = _PROBE_SCRIPT.read_text()
     result = await run_script_code(
         agent_id=agent_id,

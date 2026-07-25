@@ -8,6 +8,8 @@ belongs to which device metric so it can be found again.
 
 from typing import Optional
 
+from django.db import IntegrityError, transaction
+
 from alerts.models import Alert
 from tacticalrmm.constants import AlertSeverity, AlertType
 
@@ -73,7 +75,16 @@ def _open(device: SnmpDevice, metric: str, severity: str, message: str) -> None:
         severity=severity,
         message=message,
     )
-    SnmpAlert.objects.create(device=device, metric=metric, severity=severity, alert=alert)
+    try:
+        # savepoint: the ingest runs inside a transaction, and a concurrent poll
+        # may have linked this metric between our check and here
+        with transaction.atomic():
+            SnmpAlert.objects.create(
+                device=device, metric=metric, severity=severity, alert=alert
+            )
+    except IntegrityError:
+        # the concurrent link wins; our duplicate alert goes away
+        alert.delete()
 
     if device.email_alerts:
         _notify(device, probe, message)

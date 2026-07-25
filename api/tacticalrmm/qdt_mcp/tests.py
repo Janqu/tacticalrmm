@@ -5,6 +5,7 @@ from django.test import SimpleTestCase
 
 from qdt_mcp.server import (
     _api_key,
+    discover_snmp_device,
     get_event_log,
     list_alerts,
     mcp_asgi_app,
@@ -101,6 +102,22 @@ class TestMCPAuth(SimpleTestCase):
                 "run_as_user": False,
             },
         )
+
+
+class TestDiscoverTemplateGuard(SimpleTestCase):
+    """The discover args go through TestScript's server-side {{...}} expansion, so
+    a community of {{global.snmp_api_key}} would send the probe key to a chosen
+    host. Template syntax is therefore rejected before anything runs."""
+
+    def test_template_syntax_is_rejected(self):
+        base = {"agent_id": "abc", "ip": "10.0.0.1"}
+        for override in (
+            {"ip": "{{global.snmp_api_key}}"},
+            {"community": "{{agent.hostname}}"},
+        ):
+            with self.subTest(**override):
+                with self.assertRaises(RuntimeError):
+                    async_to_sync(discover_snmp_device)(**{**base, **override})
 
 
 class TestAlertQuery(SimpleTestCase):

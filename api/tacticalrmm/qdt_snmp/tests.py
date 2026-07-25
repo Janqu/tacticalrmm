@@ -288,6 +288,29 @@ class TestSnmpProbe(TacticalTestCase):
         self.printer_a.refresh_from_db()
         self.assertIsNone(self.printer_a.last_seen)
 
+    def test_ingest_rejects_unbounded_or_invalid_metrics(self):
+        """A buggy or compromised probe must get a 400, not a 500 or silent bloat."""
+        cases = {
+            "metric name too long": {"x" * 101: 1.0},
+            # DRF's json parser accepts NaN; a stored NaN breaks the dashboard later
+            "nan value": {"supply.black": float("nan")},
+            "infinity value": {"supply.black": float("inf")},
+            "too many metrics": {f"m{i}": 1.0 for i in range(65)},
+        }
+        for label, metrics in cases.items():
+            with self.subTest(case=label):
+                # raw json: the test client's own encoder refuses NaN, which is
+                # exactly the leniency under test on the parsing side
+                r = self.client.post(
+                    f"{BASE}/probe/{self.probe.agent_id}/devices/",
+                    json.dumps(
+                        [{"id": self.printer_a.pk, "reachable": True, "metrics": metrics}]
+                    ),
+                    content_type="application/json",
+                )
+                self.assertEqual(r.status_code, 400)
+        self.assertEqual(SnmpReading.objects.count(), 0)
+
 
 class TestThresholdAlerting(TacticalTestCase):
     """Alerts must follow state changes, not fire once per poll."""
@@ -428,6 +451,13 @@ class TestDiscoverSnmpDevice(TacticalTestCase):
         self.client.force_authenticate(user=user)
         self.assertEqual(self._post().status_code, 403)
 
+    def test_run_scripts_permission_is_required(self):
+        """Discovery executes code on an agent, so site management alone must not
+        be enough - same bar as the upstream runscript endpoints."""
+        user = self.create_user_with_roles(["can_list_sites", "can_manage_sites"])
+        self.client.force_authenticate(user=user)
+        self.assertEqual(self._post().status_code, 403)
+
     def test_foreign_site_is_rejected(self):
         other_client = baker.make("clients.Client")
         baker.make("clients.Site", client=other_client)
@@ -518,7 +548,18 @@ class TestProbeProvisioning(TacticalTestCase):
         self.assertIn("SNMP poller", script.script_body)
 
         store = GlobalKVStore.objects.get(name="snmp_api_key")
-        self.assertEqual(store.value, APIKey.objects.get(name="snmp-probe").key)
+        api_key = APIKey.objects.get(name="snmp-probe")
+        self.assertEqual(store.value, api_key.key)
+
+        # the key belongs to a minimal service user, not to the provisioning admin:
+        # it may read sites and post readings, nothing else
+        service = api_key.user
+        self.assertEqual(service.username, "snmp-probe")
+        self.assertTrue(service.block_dashboard_login)
+        self.assertFalse(service.has_usable_password())
+        self.assertTrue(service.role.can_list_sites)
+        self.assertFalse(service.role.is_superuser)
+        self.assertFalse(service.role.can_run_scripts)
 
         task = AutomatedTask.objects.get(name="QDT SNMP Poller", agent=self.agent)
         self.assertEqual(task.task_type, "daily")
@@ -594,10 +635,17 @@ class TestProbeProvisioning(TacticalTestCase):
         self.client.force_authenticate(user=user)
         self.assertEqual(self._post().status_code, 403)
 
-        # a foreign site is out of scope even with the write permission
+        # scheduling code execution on an agent wants more than site management
+        user = self.create_user_with_roles(["can_list_sites", "can_manage_sites"])
+        self.client.force_authenticate(user=user)
+        self.assertEqual(self._post().status_code, 403)
+
+        # a foreign site is out of scope even with all the right permissions
         other_client = baker.make("clients.Client")
         baker.make("clients.Site", client=other_client)
-        user = self.create_user_with_roles(["can_list_sites", "can_manage_sites"])
+        user = self.create_user_with_roles(
+            ["can_list_sites", "can_manage_sites", "can_run_scripts"]
+        )
         user.role.can_view_clients.set([other_client])
         self.client.force_authenticate(user=user)
         self.assertEqual(self._post().status_code, 403)
@@ -634,6 +682,22 @@ class TestProbeProvisioning(TacticalTestCase):
         )
         self.assertEqual(r.status_code, 200)
         self.assertIn("probe_warning", r.data)
+        sched.delay.assert_not_called()
+
+    def test_device_creation_without_run_scripts_warns_instead_of_provisioning(
+        self, sched
+    ):
+        """The device is created either way, but only a user with script rights
+        gets an automatic poller."""
+        user = self.create_user_with_roles(["can_list_sites", "can_manage_sites"])
+        self.client.force_authenticate(user=user)
+        r = self.client.post(
+            f"{BASE}/devices/",
+            {"site": self.site.pk, "name": "Drucker", "ip": "10.0.0.10"},
+            format="json",
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("can_run_scripts", r.data["probe_warning"])
         sched.delay.assert_not_called()
 
 
