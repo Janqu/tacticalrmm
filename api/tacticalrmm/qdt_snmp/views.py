@@ -1,5 +1,6 @@
 import asyncio
 import datetime as dt
+import ipaddress
 import json
 import logging
 from pathlib import Path
@@ -184,46 +185,112 @@ class DiscoverSnmpDevice(APIView):
         if not _has_perm_on_agent(request.user, agent.agent_id):
             raise PermissionDenied()
 
-        data = {
-            "func": "runscriptfull",
-            "timeout": DISCOVER_TIMEOUT,
-            "script_args": ["--dump", ip, "--community", community, "--port", str(port)],
-            "payload": {"code": PROBE_SCRIPT.read_text(), "shell": "python"},
-            "run_as_user": False,
-            "env_vars": [],
-            "nushell_enable_config": settings.NUSHELL_ENABLE_CONFIG,
-            "deno_default_permissions": settings.DENO_DEFAULT_PERMISSIONS,
-        }
-        r = asyncio.run(agent.nats_cmd(data, timeout=DISCOVER_TIMEOUT + 5, wait=True))
-
-        # the audit record gets the masked community, same convention as the api
-        audited = {
-            **data,
-            "script_args": [
-                mask_token(a) if a == community else a for a in data["script_args"]
-            ],
-        }
-        AuditLog.audit_test_script_run(
-            username=request.user.username,
-            agent=agent,
-            before_value=audited,
-            after_value=r,
-            debug_info={"ip": request._client_ip},
+        result = _run_probe(
+            request,
+            agent,
+            ["--dump", ip, "--community", community, "--port", str(port)],
+            secret=community,
         )
+        if isinstance(result, Response):
+            return result
+        return Response(result)
 
-        if r == "timeout":
-            return notify_error(f"the probe agent {agent.hostname} did not answer in time")
-        if r == "natsdown":
-            return notify_error("the agent cannot be reached right now")
-        if not isinstance(r, dict):
-            return notify_error("unexpected answer from the probe agent")
-        if r.get("retcode"):
-            detail = (r.get("stderr") or r.get("stdout") or "unknown error").strip()
-            return notify_error(f"discovery failed on {agent.hostname}: {detail}")
+
+def _run_probe(request, agent, script_args: list, secret: str = ""):
+    """Ship the probe script to an agent and parse what it prints.
+
+    Returns the parsed json on success, or an error Response. `secret` is masked
+    in the audit record - the community never lands in the log in the clear.
+    """
+    data = {
+        "func": "runscriptfull",
+        "timeout": DISCOVER_TIMEOUT,
+        "script_args": script_args,
+        "payload": {"code": PROBE_SCRIPT.read_text(), "shell": "python"},
+        "run_as_user": False,
+        "env_vars": [],
+        "nushell_enable_config": settings.NUSHELL_ENABLE_CONFIG,
+        "deno_default_permissions": settings.DENO_DEFAULT_PERMISSIONS,
+    }
+    r = asyncio.run(agent.nats_cmd(data, timeout=DISCOVER_TIMEOUT + 5, wait=True))
+
+    audited = dict(data)
+    if secret:
+        audited["script_args"] = [
+            mask_token(a) if a == secret else a for a in script_args
+        ]
+    AuditLog.audit_test_script_run(
+        username=request.user.username,
+        agent=agent,
+        before_value=audited,
+        after_value=r,
+        debug_info={"ip": request._client_ip},
+    )
+
+    if r == "timeout":
+        return notify_error(f"the probe agent {agent.hostname} did not answer in time")
+    if r == "natsdown":
+        return notify_error("the agent cannot be reached right now")
+    if not isinstance(r, dict):
+        return notify_error("unexpected answer from the probe agent")
+    if r.get("retcode"):
+        detail = (r.get("stderr") or r.get("stdout") or "unknown error").strip()
+        return notify_error(f"the probe failed on {agent.hostname}: {detail}")
+    try:
+        return json.loads(r.get("stdout") or "")
+    except ValueError:
+        return notify_error("the probe did not return json")
+
+
+class ScanSnmpSubnet(APIView):
+    """Probe a whole subnet from the site's probe agent and list what answers.
+
+    Same permission bar as DiscoverSnmpDevice: this sends packets to up to a
+    thousand hosts, so it is gated like running code on the agent.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    MAX_HOSTS = 1024
+
+    def post(self, request):
+        _require(request, WRITE_PERM)
+        _require(request, "can_run_scripts")
+
+        site_id = request.data.get("site")
+        cidr = str(request.data.get("cidr") or "").strip()
+        if not site_id or not cidr:
+            return notify_error("site and cidr are required")
+        _require_site(request, site_id)
+
         try:
-            return Response(json.loads(r.get("stdout") or ""))
+            network = ipaddress.ip_network(cidr, strict=False)
         except ValueError:
-            return notify_error("the probe did not return json")
+            return notify_error("cidr is not a valid subnet")
+        if network.num_addresses > self.MAX_HOSTS:
+            return notify_error("subnet too large, /22 is the maximum")
+
+        try:
+            port = int(request.data.get("port") or 161)
+        except (TypeError, ValueError):
+            return notify_error("port must be an integer")
+        community = str(request.data.get("community") or "public")
+
+        agent = pick_probe_agent(site_id)
+        if agent is None:
+            return notify_error("no online agent at this site to probe from")
+        if not _has_perm_on_agent(request.user, agent.agent_id):
+            raise PermissionDenied()
+
+        result = _run_probe(
+            request,
+            agent,
+            ["--scan", cidr, "--community", community, "--port", str(port)],
+            secret=community,
+        )
+        if isinstance(result, Response):
+            return result
+        return Response(result)
 
 
 class SiteProbe(APIView):
@@ -337,6 +404,60 @@ class SnmpOpenAlerts(APIView):
                 for a in alerts
             ]
         )
+
+
+class SnmpDeviceCounters(APIView):
+    """Printed pages per calendar month, from the pages.total counter readings.
+
+    The counter only ever climbs, so a month's volume is last-reading minus the
+    previous month's last reading. A drop means the counter was reset (firmware
+    update, exchanged unit) - that month gets no number instead of a negative one.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    MAX_MONTHS = 36
+
+    def get(self, request, pk):
+        _require(request, READ_PERM)
+        device = get_object_or_404(SnmpDevice, pk=pk)
+        _require_site(request, device.site_id)
+
+        try:
+            months = min(int(request.query_params.get("months", 12)), self.MAX_MONTHS)
+        except ValueError:
+            return notify_error("months must be an integer")
+
+        # last reading per month over the whole series, so the first month in the
+        # window still gets its delta against the month before it
+        last_of_month: dict = {}
+        for ts, value in (
+            device.readings.filter(metric="pages.total", value__isnull=False)
+            .order_by("timestamp")
+            .values_list("timestamp", "value")
+        ):
+            last_of_month[(ts.year, ts.month)] = value
+
+        out = []
+        previous = None
+        for year, month in sorted(last_of_month):
+            counter = last_of_month[(year, month)]
+            reset = previous is not None and counter < previous
+            out.append(
+                {
+                    "month": f"{year}-{month:02d}",
+                    "counter": counter,
+                    "pages": (
+                        None
+                        if previous is None or reset
+                        else round(counter - previous)
+                    ),
+                    "reset": reset,
+                }
+            )
+            previous = counter
+
+        return Response(out[-months:])
 
 
 class ProbeDevices(APIView):

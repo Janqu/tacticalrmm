@@ -2,6 +2,7 @@ import json
 from unittest.mock import patch
 
 from django.test import SimpleTestCase
+from django.utils import timezone as djangotime
 from model_bakery import baker
 from rest_framework.exceptions import ValidationError
 
@@ -521,6 +522,67 @@ class TestDiscoverSnmpDevice(TacticalTestCase):
         self.assertEqual(self._post(port="abc").status_code, 400)
 
 
+class TestScanSnmpSubnet(TacticalTestCase):
+    """Subnet scans from the probe agent: same bar as discovery, since both send
+    packets from inside the customer's LAN."""
+
+    def setUp(self):
+        self.setup_coresettings()
+        self.authenticate()
+        self.site = baker.make("clients.Site")
+        self.agent = baker.make_recipe("agents.online_agent", site=self.site)
+
+    def _post(self, **overrides):
+        return self.client.post(
+            f"{BASE}/scan/",
+            {"site": self.site.pk, "cidr": "10.0.0.0/29", **overrides},
+            format="json",
+        )
+
+    def test_not_authenticated(self):
+        self.check_not_authenticated("post", f"{BASE}/scan/")
+
+    def test_permissions(self):
+        for roles in (["can_list_sites"], ["can_list_sites", "can_manage_sites"]):
+            with self.subTest(roles=roles):
+                user = self.create_user_with_roles(roles)
+                self.client.force_authenticate(user=user)
+                self.assertEqual(self._post().status_code, 403)
+
+    def test_invalid_or_oversized_cidr_is_rejected(self):
+        self.assertEqual(self._post(cidr="not-a-subnet").status_code, 400)
+        self.assertEqual(self._post(cidr="10.0.0.0/16").status_code, 400)
+
+    def test_no_online_agent_is_a_400(self):
+        self.agent.last_seen = None
+        self.agent.save()
+        self.assertEqual(self._post().status_code, 400)
+
+    @patch("agents.models.Agent.nats_cmd")
+    def test_scan_returns_the_responders(self, nats_cmd):
+        responders = [
+            {"ip": "10.0.0.5", "sys_descr": "HP LaserJet", "sys_name": "drucker1"},
+            {"ip": "10.0.0.6", "sys_descr": "APC UPS", "sys_name": None},
+        ]
+        nats_cmd.return_value = {"stdout": json.dumps(responders), "stderr": "", "retcode": 0}
+
+        r = self._post(community="secret")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data, responders)
+
+        data = nats_cmd.call_args.args[0]
+        self.assertEqual(
+            data["script_args"],
+            ["--scan", "10.0.0.0/29", "--community", "secret", "--port", "161"],
+        )
+
+        # the community must not land in the audit log in the clear
+        from logs.models import AuditLog
+
+        entry = AuditLog.objects.order_by("-id").first()
+        self.assertNotIn("secret", str(entry.before_value))
+
+
 @patch("qdt_snmp.provisioning.create_win_task_schedule")
 class TestProbeProvisioning(TacticalTestCase):
     """The first device at a site must not mean four manual setup steps."""
@@ -767,6 +829,49 @@ class TestFleetEndpoints(TacticalTestCase):
         self.client.force_authenticate(user=user)
         self.assertEqual(self.client.get(f"{BASE}/latest/").status_code, 403)
         self.assertEqual(self.client.get(f"{BASE}/alerts/").status_code, 403)
+
+
+class TestSnmpDeviceCounters(TacticalTestCase):
+    """Monthly page counts for billing, robust against counter resets."""
+
+    def setUp(self):
+        self.setup_coresettings()
+        self.authenticate()
+        self.device = baker.make("qdt_snmp.SnmpDevice")
+
+    def _reading(self, year, month, day, value):
+        reading = baker.make(
+            "qdt_snmp.SnmpReading", device=self.device, metric="pages.total", value=value
+        )
+        SnmpReading.objects.filter(pk=reading.pk).update(
+            timestamp=djangotime.datetime(year, month, day, tzinfo=djangotime.utc)
+        )
+
+    def test_monthly_deltas_use_the_last_reading_of_each_month(self):
+        self._reading(2026, 5, 31, 1000.0)
+        self._reading(2026, 6, 10, 1500.0)
+        self._reading(2026, 6, 30, 1600.0)
+        self._reading(2026, 7, 15, 500.0)  # counter reset
+
+        r = self.client.get(f"{BASE}/devices/{self.device.pk}/counters/")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(
+            r.data,
+            [
+                {"month": "2026-05", "counter": 1000.0, "pages": None, "reset": False},
+                {"month": "2026-06", "counter": 1600.0, "pages": 600, "reset": False},
+                {"month": "2026-07", "counter": 500.0, "pages": None, "reset": True},
+            ],
+        )
+
+    def test_scoped_user_gets_no_counters(self):
+        other_client = baker.make("clients.Client")
+        baker.make("clients.Site", client=other_client)
+        user = self.create_user_with_roles(["can_list_sites"])
+        user.role.can_view_clients.set([other_client])
+        self.client.force_authenticate(user=user)
+        r = self.client.get(f"{BASE}/devices/{self.device.pk}/counters/")
+        self.assertEqual(r.status_code, 403)
 
 
 class TestSnmpReadingPrune(TacticalTestCase):

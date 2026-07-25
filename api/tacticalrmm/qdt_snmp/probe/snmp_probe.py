@@ -26,6 +26,7 @@ Run with --selftest to check the codec and the decoding without a network.
 """
 
 import argparse
+import ipaddress
 import json
 import re
 import socket
@@ -373,6 +374,56 @@ def poll_from_map(host, port, community, metric_map, timeout, retries) -> tuple:
     return data.get(SYS_DESCR), None, metrics
 
 
+def scan_subnet(cidr: str, port: int, community: str, timeout: float, retries: int) -> list:
+    """Probe every host in a subnet for SNMP at once.
+
+    UDP is connectionless, so all requests go out in one burst and the replies
+    are collected until they stop coming - a /24 answers in a couple of seconds
+    instead of 256 sequential timeouts.
+    """
+    hosts = [str(h) for h in ipaddress.ip_network(cidr, strict=False).hosts()]
+    if len(hosts) > 1024:
+        raise ValueError("subnet too large, /22 (1022 hosts) is the maximum")
+
+    found = {}
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for _ in range(retries + 1):
+            missing = [h for h in hosts if h not in found]
+            if not missing:
+                break
+            for i, host in enumerate(missing):
+                try:
+                    sock.sendto(build_get(community, [SYS_DESCR, SYS_NAME], i + 1), (host, port))
+                except OSError:
+                    continue
+
+            # collect until the replies stop, not until every host answered
+            sock.settimeout(timeout)
+            while True:
+                try:
+                    data, (host, _) = sock.recvfrom(65535)
+                except (socket.timeout, OSError):
+                    break
+                try:
+                    values = parse_response(data)
+                except Exception:
+                    continue
+                if SYS_DESCR in values and host in hosts:
+                    found[host] = {
+                        "ip": host,
+                        "sys_descr": values.get(SYS_DESCR),
+                        "sys_name": values.get(SYS_NAME),
+                    }
+    finally:
+        sock.close()
+
+    return [
+        found[h]
+        for h in sorted(found, key=lambda h: tuple(int(p) for p in h.split(".")))
+    ]
+
+
 # ------------------------------------------------------------------ discovery
 
 # subtrees worth showing when working out what a device actually exposes
@@ -543,14 +594,27 @@ def main() -> int:
         help="walk one device and print what it exposes as json, then exit. "
         "Needs no server, use it to work out a metric_map for a new model.",
     )
-    parser.add_argument("--community", default="public", help="only with --dump")
-    parser.add_argument("--port", type=int, default=161, help="only with --dump")
+    parser.add_argument(
+        "--scan",
+        metavar="CIDR",
+        help="probe every host in the subnet for SNMP and print the responders "
+        "as json, then exit. Needs no server.",
+    )
+    parser.add_argument("--community", default="public", help="only with --dump/--scan")
+    parser.add_argument("--port", type=int, default=161, help="only with --dump/--scan")
     args = parser.parse_args()
 
     if args.dump:
         print(json.dumps(
             dump(args.dump, args.port, args.community, args.timeout, args.retries),
             indent=2, ensure_ascii=False,
+        ))
+        return 0
+
+    if args.scan:
+        print(json.dumps(
+            scan_subnet(args.scan, args.port, args.community, args.timeout, args.retries),
+            ensure_ascii=False,
         ))
         return 0
 
@@ -748,6 +812,47 @@ def selftest() -> int:
         "supply.black_cartridge": 50.0,
         "tray.tray_1": 50.0,
     }, metrics
+
+    # a subnet scan sends one request per host and keeps only snmp responders
+    class FakeSocket:
+        def __init__(self, *args, **kwargs):
+            self.sent = []
+            self._answered = False
+
+        def settimeout(self, timeout):
+            pass
+
+        def sendto(self, data, addr):
+            self.sent.append(addr)
+
+        def recvfrom(self, size):
+            if self._answered:
+                raise socket.timeout()
+            self._answered = True
+            vb = _tlv(SEQUENCE, _enc_oid(SYS_DESCR) + _tlv(OCTET_STRING, b"Test Printer"))
+            pdu = _tlv(GET_RESPONSE, _enc_int(1) + _enc_int(0) + _enc_int(0) + _tlv(SEQUENCE, vb))
+            msg = _tlv(SEQUENCE, _enc_int(1) + _tlv(OCTET_STRING, b"public") + pdu)
+            return msg, ("10.0.0.5", 161)
+
+        def close(self):
+            pass
+
+    original_socket = socket.socket
+    socket.socket = FakeSocket
+    try:
+        found = scan_subnet("10.0.0.0/29", 161, "public", 0.01, 0)
+    finally:
+        socket.socket = original_socket
+    assert found == [
+        {"ip": "10.0.0.5", "sys_descr": "Test Printer", "sys_name": None}
+    ], found
+
+    # oversized subnets are refused before a single packet goes out
+    try:
+        scan_subnet("10.0.0.0/16", 161, "public", 0.01, 0)
+        raise AssertionError("a /16 must be refused")
+    except ValueError:
+        pass
 
     print("selftest ok")
     return 0
