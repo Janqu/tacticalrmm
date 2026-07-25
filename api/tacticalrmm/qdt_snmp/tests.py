@@ -1,3 +1,6 @@
+import json
+from unittest.mock import patch
+
 from django.test import SimpleTestCase
 from model_bakery import baker
 from rest_framework.exceptions import ValidationError
@@ -398,6 +401,94 @@ class TestThresholdValidation(TacticalTestCase):
         for label, bad in cases.items():
             with self.subTest(case=label):
                 self.assertEqual(self._post(bad).status_code, 400)
+
+
+class TestDiscoverSnmpDevice(TacticalTestCase):
+    """The form's "Erkennen" button: the same walk the discover_snmp_device MCP
+    tool does, but reachable from the dashboard without an assistant in the loop."""
+
+    def setUp(self):
+        self.setup_coresettings()
+        self.authenticate()
+        self.site = baker.make("clients.Site")
+        self.agent = baker.make_recipe("agents.online_agent", site=self.site)
+
+    def _post(self, **overrides):
+        return self.client.post(
+            f"{BASE}/discover/",
+            {"site": self.site.pk, "ip": "10.0.0.10", **overrides},
+            format="json",
+        )
+
+    def test_not_authenticated(self):
+        self.check_not_authenticated("post", f"{BASE}/discover/")
+
+    def test_write_permission_is_required(self):
+        user = self.create_user_with_roles(["can_list_sites"])
+        self.client.force_authenticate(user=user)
+        self.assertEqual(self._post().status_code, 403)
+
+    def test_foreign_site_is_rejected(self):
+        other_client = baker.make("clients.Client")
+        baker.make("clients.Site", client=other_client)
+        user = self.create_user_with_roles(["can_list_sites", "can_manage_sites"])
+        user.role.can_view_clients.set([other_client])
+        self.client.force_authenticate(user=user)
+        self.assertEqual(self._post().status_code, 403)
+
+    def test_no_online_agent_at_the_site(self):
+        self.agent.last_seen = None
+        self.agent.save()
+        r = self._post()
+        self.assertEqual(r.status_code, 400)
+
+    @patch("agents.models.Agent.nats_cmd")
+    def test_walk_returns_the_suggestion(self, nats_cmd):
+        dump = {
+            "host": "10.0.0.10",
+            "sys_descr": "HP LaserJet",
+            "suggested_metric_map": {
+                "supply.black": {"oid": "1.3.6.1.43.11.1.1.9.1.1", "max_oid": "1.3.6.1.43.11.1.1.8.1.1"},
+            },
+        }
+        nats_cmd.return_value = {"stdout": json.dumps(dump), "stderr": "", "retcode": 0}
+
+        r = self._post()
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data["suggested_metric_map"], dump["suggested_metric_map"])
+
+        data = nats_cmd.call_args.args[0]
+        self.assertEqual(data["func"], "runscriptfull")
+        self.assertEqual(
+            data["script_args"], ["--dump", "10.0.0.10", "--community", "public", "--port", "161"]
+        )
+
+    @patch("agents.models.Agent.nats_cmd")
+    def test_masked_community_means_the_stored_one(self, nats_cmd):
+        """The edit form only ever sees the masked community; sending it back must
+        probe with the real one, not with the bullets."""
+        device = baker.make(
+            "qdt_snmp.SnmpDevice", site=self.site, community="secret-a"
+        )
+        nats_cmd.return_value = {"stdout": "{}", "stderr": "", "retcode": 0}
+
+        r = self._post(community="••••et-a", device=device.pk)
+        self.assertEqual(r.status_code, 200)
+        data = nats_cmd.call_args.args[0]
+        self.assertIn("secret-a", data["script_args"])
+
+    @patch("agents.models.Agent.nats_cmd")
+    def test_probe_failure_surfaces_the_error(self, nats_cmd):
+        nats_cmd.return_value = {"stdout": "", "stderr": "snmp timeout", "retcode": 1}
+        r = self._post()
+        self.assertEqual(r.status_code, 400)
+
+    @patch("agents.models.Agent.nats_cmd", return_value="timeout")
+    def test_agent_timeout_is_a_400_not_a_hang(self, nats_cmd):
+        self.assertEqual(self._post().status_code, 400)
+
+    def test_malformed_port_is_rejected(self):
+        self.assertEqual(self._post(port="abc").status_code, 400)
 
 
 class TestSnmpReadingPrune(TacticalTestCase):

@@ -1,5 +1,9 @@
+import asyncio
 import datetime as dt
+import json
+from pathlib import Path
 
+from django.conf import settings
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone as djangotime
@@ -9,6 +13,9 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from agents.models import Agent
+from core.serializers import mask_token
+from logs.models import AuditLog
+from tacticalrmm.constants import AGENT_STATUS_ONLINE
 from tacticalrmm.helpers import notify_error
 from tacticalrmm.permissions import _has_perm, _has_perm_on_agent, _has_perm_on_site
 
@@ -27,6 +34,11 @@ READ_PERM = "can_list_sites"
 WRITE_PERM = "can_manage_sites"
 
 MAX_READING_DAYS = 365
+
+# shipped to the probe agent for discovery, so the "Erkennen" button always runs the
+# same code as the scheduled poll rather than a copy that can drift
+PROBE_SCRIPT = Path(__file__).resolve().parent / "probe" / "snmp_probe.py"
+DISCOVER_TIMEOUT = 120
 
 
 def _require(request, perm: str) -> None:
@@ -97,6 +109,93 @@ class GetUpdateDeleteSnmpDevice(APIView):
     def delete(self, request, pk):
         self._get(request, pk, WRITE_PERM).delete()
         return Response("Device was removed")
+
+
+class DiscoverSnmpDevice(APIView):
+    """The "Erkennen" button in the device form. Walks the device from an online
+    agent at its site — the same thing the discover_snmp_device MCP tool does — and
+    returns what the device actually exposes, including a suggested metric_map."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        _require(request, WRITE_PERM)
+
+        site_id = request.data.get("site")
+        ip = str(request.data.get("ip") or "").strip()
+        if not site_id or not ip:
+            return notify_error("site and ip are required")
+        _require_site(request, site_id)
+
+        try:
+            port = int(request.data.get("port") or 161)
+        except (TypeError, ValueError):
+            return notify_error("port must be an integer")
+
+        community = str(request.data.get("community") or "public")
+        if "•" in community and request.data.get("device"):
+            # the edit form shows the community masked; an unchanged value means
+            # "the stored one", which only the server still has
+            device = get_object_or_404(
+                SnmpDevice, pk=request.data["device"], site_id=site_id
+            )
+            community = device.community
+
+        agent = next(
+            (
+                a
+                for a in Agent.objects.filter(site_id=site_id).order_by(
+                    # "server" sorts before "workstation", and a server is the
+                    # more likely probe
+                    "monitoring_type"
+                )
+                if a.status == AGENT_STATUS_ONLINE
+            ),
+            None,
+        )
+        if agent is None:
+            return notify_error("no online agent at this site to probe from")
+
+        data = {
+            "func": "runscriptfull",
+            "timeout": DISCOVER_TIMEOUT,
+            "script_args": ["--dump", ip, "--community", community, "--port", str(port)],
+            "payload": {"code": PROBE_SCRIPT.read_text(), "shell": "python"},
+            "run_as_user": False,
+            "env_vars": [],
+            "nushell_enable_config": settings.NUSHELL_ENABLE_CONFIG,
+            "deno_default_permissions": settings.DENO_DEFAULT_PERMISSIONS,
+        }
+        r = asyncio.run(agent.nats_cmd(data, timeout=DISCOVER_TIMEOUT + 5, wait=True))
+
+        # the audit record gets the masked community, same convention as the api
+        audited = {
+            **data,
+            "script_args": [
+                mask_token(a) if a == community else a for a in data["script_args"]
+            ],
+        }
+        AuditLog.audit_test_script_run(
+            username=request.user.username,
+            agent=agent,
+            before_value=audited,
+            after_value=r,
+            debug_info={"ip": request._client_ip},
+        )
+
+        if r == "timeout":
+            return notify_error(f"the probe agent {agent.hostname} did not answer in time")
+        if r == "natsdown":
+            return notify_error("the agent cannot be reached right now")
+        if not isinstance(r, dict):
+            return notify_error("unexpected answer from the probe agent")
+        if r.get("retcode"):
+            detail = (r.get("stderr") or r.get("stdout") or "unknown error").strip()
+            return notify_error(f"discovery failed on {agent.hostname}: {detail}")
+        try:
+            return Response(json.loads(r.get("stdout") or ""))
+        except ValueError:
+            return notify_error("the probe did not return json")
 
 
 class SnmpDeviceReadings(APIView):
