@@ -8,6 +8,33 @@ from .models import SnmpDevice, SnmpReading
 
 OID_RE = re.compile(r"^\d+(\.\d+)+$")
 ALLOWED_MAP_KEYS = {"oid", "max_oid", "scale"}
+ALLOWED_THRESHOLD_KEYS = {"warning", "error", "direction"}
+
+
+def validate_thresholds(value):
+    """A typo here means an alert that never fires, which nobody notices."""
+    if not value:
+        return {}
+    if not isinstance(value, dict):
+        raise serializers.ValidationError("thresholds must be an object")
+
+    for metric, spec in value.items():
+        if not isinstance(spec, dict):
+            raise serializers.ValidationError(f"{metric}: entry must be an object")
+        unknown = set(spec) - ALLOWED_THRESHOLD_KEYS
+        if unknown:
+            raise serializers.ValidationError(
+                f"{metric}: unknown keys {sorted(unknown)}, allowed are {sorted(ALLOWED_THRESHOLD_KEYS)}"
+            )
+        if not {"warning", "error"} & set(spec):
+            raise serializers.ValidationError(f"{metric}: needs a warning or an error level")
+        for level in ("warning", "error"):
+            if level in spec and not isinstance(spec[level], (int, float)):
+                raise serializers.ValidationError(f"{metric}: {level} must be a number")
+        if spec.get("direction", "below") not in ("below", "above"):
+            raise serializers.ValidationError(f"{metric}: direction must be below or above")
+
+    return value
 
 
 def validate_metric_map(value):
@@ -61,6 +88,8 @@ class SnmpDeviceSerializer(serializers.ModelSerializer):
             "description",
             "offline_minutes",
             "metric_map",
+            "thresholds",
+            "email_alerts",
             "model_name",
             "serial",
             "last_seen",
@@ -71,6 +100,9 @@ class SnmpDeviceSerializer(serializers.ModelSerializer):
 
     def validate_metric_map(self, value):
         return validate_metric_map(value)
+
+    def validate_thresholds(self, value):
+        return validate_thresholds(value)
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)

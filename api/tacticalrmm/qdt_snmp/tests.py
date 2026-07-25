@@ -2,7 +2,7 @@ from model_bakery import baker
 
 from tacticalrmm.test import TacticalTestCase
 
-from .models import SnmpDevice, SnmpReading
+from .models import SnmpAlert, SnmpDevice, SnmpReading
 
 BASE = "/qdt_snmp"
 
@@ -261,6 +261,119 @@ class TestSnmpProbe(TacticalTestCase):
         self.assertEqual(SnmpReading.objects.count(), 0)
         self.printer_a.refresh_from_db()
         self.assertIsNone(self.printer_a.last_seen)
+
+
+class TestThresholdAlerting(TacticalTestCase):
+    """Alerts must follow state changes, not fire once per poll."""
+
+    def setUp(self):
+        self.setup_coresettings()
+        self.authenticate()
+        self.site = baker.make("clients.Site")
+        self.probe = baker.make_recipe("agents.agent", site=self.site)
+        self.printer = baker.make(
+            "qdt_snmp.SnmpDevice", site=self.site, name="Drucker", device_type="printer"
+        )
+
+    def _ingest(self, metrics=None, reachable=True):
+        return self.client.post(
+            f"{BASE}/probe/{self.probe.agent_id}/devices/",
+            [{"id": self.printer.pk, "reachable": reachable, "metrics": metrics or {}}],
+            format="json",
+        )
+
+    def _open_alerts(self):
+        return SnmpAlert.objects.filter(device=self.printer)
+
+    def test_default_thresholds_apply_to_any_supply_colour(self):
+        # "supply." is a prefix rule, so a colour nobody configured still alerts
+        r = self._ingest({"supply.magenta": 8.0})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(len(r.data["alerts"]), 1)
+        self.assertEqual(self._open_alerts().get().severity, "error")
+
+    def test_repeated_polls_below_the_threshold_do_not_realert(self):
+        self._ingest({"supply.black": 8.0})
+        r = self._ingest({"supply.black": 7.0})
+        self.assertEqual(r.data["alerts"], [], "an unchanged state must stay quiet")
+        self.assertEqual(self._open_alerts().count(), 1)
+
+    def test_severity_change_raises_again(self):
+        self._ingest({"supply.black": 15.0})
+        self.assertEqual(self._open_alerts().get().severity, "warning")
+        r = self._ingest({"supply.black": 5.0})
+        self.assertEqual(len(r.data["alerts"]), 1)
+        self.assertEqual(self._open_alerts().get().severity, "error")
+        self.assertEqual(self._open_alerts().count(), 1, "no duplicate for one metric")
+
+    def test_recovery_resolves_the_alert(self):
+        self._ingest({"supply.black": 5.0})
+        alert = self._open_alerts().get().alert
+        self._ingest({"supply.black": 80.0})
+        self.assertFalse(self._open_alerts().exists())
+        alert.refresh_from_db()
+        self.assertTrue(alert.resolved)
+
+    def test_per_device_thresholds_override_the_type_default(self):
+        self.printer.thresholds = {"supply.black": {"warning": 90, "error": 85}}
+        self.printer.save()
+        r = self._ingest({"supply.black": 88.0})
+        self.assertEqual(self._open_alerts().get().severity, "warning")
+        self.assertEqual(len(r.data["alerts"]), 1)
+
+    def test_unreachable_raises_once_and_leaves_supply_alerts_alone(self):
+        self._ingest({"supply.black": 5.0})
+        r = self._ingest(reachable=False)
+        self.assertEqual(len(r.data["alerts"]), 1)
+        # a silent device says nothing about its toner
+        self.assertEqual(
+            set(self._open_alerts().values_list("metric", flat=True)),
+            {"supply.black", "__unreachable__"},
+        )
+        r = self._ingest(reachable=False)
+        self.assertEqual(r.data["alerts"], [])
+
+        self._ingest({"supply.black": 5.0})
+        self.assertEqual(
+            set(self._open_alerts().values_list("metric", flat=True)), {"supply.black"}
+        )
+
+    def test_metrics_without_a_threshold_are_ignored(self):
+        r = self._ingest({"pages.total": 15234.0})
+        self.assertEqual(r.data["alerts"], [])
+        self.assertFalse(self._open_alerts().exists())
+
+
+class TestThresholdValidation(TacticalTestCase):
+    def setUp(self):
+        self.setup_coresettings()
+        self.authenticate()
+        self.site = baker.make("clients.Site")
+
+    def _post(self, thresholds):
+        return self.client.post(
+            f"{BASE}/devices/",
+            {"site": self.site.pk, "name": "D", "ip": "10.0.0.5", "thresholds": thresholds},
+            format="json",
+        )
+
+    def test_valid(self):
+        good = {"supply.": {"warning": 20, "error": 10, "direction": "below"}}
+        r = self._post(good)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(SnmpDevice.objects.get(pk=r.data["id"]).thresholds, good)
+
+    def test_rejected(self):
+        cases = {
+            "no level": {"a": {"direction": "below"}},
+            "level not numeric": {"a": {"warning": "viel"}},
+            "bad direction": {"a": {"warning": 1, "direction": "sideways"}},
+            "unknown key": {"a": {"warning": 1, "colour": "red"}},
+            "entry not object": {"a": 5},
+        }
+        for label, bad in cases.items():
+            with self.subTest(case=label):
+                self.assertEqual(self._post(bad).status_code, 400)
 
 
 class TestSnmpReadingPrune(TacticalTestCase):

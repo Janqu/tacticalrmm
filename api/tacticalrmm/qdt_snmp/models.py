@@ -82,6 +82,14 @@ class SnmpDevice(models.Model):
     # so the mapping lives on the device where discovery can write it.
     metric_map = models.JSONField(default=dict, blank=True)
 
+    # {"supply.black": {"warning": 20, "error": 10, "direction": "below"}}
+    # A key ending in "." matches by prefix, so "supply." covers every colour.
+    # Empty falls back to DEFAULT_THRESHOLDS for the device type.
+    thresholds = models.JSONField(default=dict, blank=True)
+
+    # off by default: a misconfigured threshold across a fleet is a mail flood
+    email_alerts = models.BooleanField(default=False)
+
     # filled in by the probe
     model_name = models.CharField(max_length=255, null=True, blank=True)
     serial = models.CharField(max_length=255, null=True, blank=True)
@@ -150,3 +158,32 @@ class SnmpReading(models.Model):
         cutoff = djangotime.now() - djangotime.timedelta(days=days)
         deleted, _ = SnmpReading.objects.filter(timestamp__lt=cutoff).delete()
         return deleted
+
+
+class SnmpAlert(models.Model):
+    """Links a device metric to the TRMM Alert currently open for it.
+
+    Needed because Alert has no device FK - it hangs off an agent - so without this
+    there is no way to find the open alert for "this device, this metric" again and
+    resolve it. Matching on the message text would be guesswork.
+    """
+
+    device = models.ForeignKey(
+        SnmpDevice, related_name="alerts", on_delete=models.CASCADE
+    )
+    metric = models.CharField(max_length=100)
+    severity = models.CharField(max_length=20)
+    alert = models.ForeignKey(
+        "alerts.Alert", related_name="+", null=True, blank=True, on_delete=models.SET_NULL
+    )
+    created_time = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["device", "metric"], name="unique_open_snmp_alert_per_metric"
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.device.name} {self.metric} {self.severity}"

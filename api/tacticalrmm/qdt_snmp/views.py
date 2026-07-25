@@ -12,6 +12,7 @@ from agents.models import Agent
 from tacticalrmm.helpers import notify_error
 from tacticalrmm.permissions import _has_perm, _has_perm_on_agent, _has_perm_on_site
 
+from .alerting import evaluate
 from .models import SnmpDevice, SnmpReading
 from .serializers import (
     SnmpDeviceSerializer,
@@ -152,7 +153,7 @@ class ProbeDevices(APIView):
             return notify_error(f"unknown or disabled device ids for this site: {unknown}")
 
         now = djangotime.now()
-        readings = []
+        readings, raised = [], []
 
         with transaction.atomic():
             for result in serializer.validated_data:
@@ -171,11 +172,17 @@ class ProbeDevices(APIView):
                     update_fields=["last_seen", "last_error", "model_name", "serial"]
                 )
 
+                metrics = result.get("metrics") or {}
                 readings += [
                     SnmpReading(device=device, metric=metric, value=value)
-                    for metric, value in (result.get("metrics") or {}).items()
+                    for metric, value in metrics.items()
                 ]
+                raised += evaluate(device, metrics, result["reachable"])
 
             SnmpReading.objects.bulk_create(readings)
 
-        return Response({"devices": len(serializer.validated_data), "readings": len(readings)})
+        return Response({
+            "devices": len(serializer.validated_data),
+            "readings": len(readings),
+            "alerts": raised,
+        })
