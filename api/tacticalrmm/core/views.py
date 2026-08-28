@@ -9,6 +9,7 @@ import requests
 import validators
 from cryptography import x509
 from django.conf import settings
+from django.core.cache import cache
 from django.db import IntegrityError
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
@@ -880,24 +881,20 @@ class AIChatCompletion(APIView):
 
     permission_classes = [IsAuthenticated]
 
-    # simple in-memory rate limit: max requests per minute per user
-    _rate_limit_bucket: dict[int, list[float]] = {}
     MAX_REQUESTS_PER_MINUTE = 30
     MAX_TOOL_CALLS_PER_REQUEST = 10
     MAX_MESSAGE_LENGTH = 4000
     MAX_MESSAGES = 50
 
     def _rate_limited(self, user_id: int) -> bool:
-        # the bucket is per-process and would grow without bound otherwise
-        if len(self._rate_limit_bucket) > 5000:
-            self._rate_limit_bucket.clear()
-        now = djangotime.now().timestamp()
-        window = [ts for ts in self._rate_limit_bucket.get(user_id, []) if now - ts < 60]
-        self._rate_limit_bucket[user_id] = window
-        if len(window) >= self.MAX_REQUESTS_PER_MINUTE:
-            return True
-        window.append(now)
-        return False
+        # cache-backed so the limit holds across workers, not just per process
+        key = f"ai-chat-rate-{user_id}"
+        try:
+            count = cache.incr(key)
+        except ValueError:
+            cache.set(key, 1, timeout=60)
+            count = 1
+        return count > self.MAX_REQUESTS_PER_MINUTE
 
     def _llm_settings(self):
         settings = get_core_settings()
@@ -1026,6 +1023,20 @@ class AIChatCompletion(APIView):
 
         return AIChatSession.objects.create(user=request.user, title=title)
 
+    @staticmethod
+    def _was_proposed(session: AIChatSession, confirmed_tool: dict) -> bool:
+        """A confirmed tool must be one the assistant actually proposed in this
+        session and the user was shown. Otherwise "confirmed" is just a direct
+        execution api for whatever the client makes up."""
+        last = session.messages.filter(role="assistant").order_by("-id").first()
+        pending = (last.tool_calls or {}).get("pending_tool_calls", []) if last else []
+        name = confirmed_tool.get("name")
+        arguments = confirmed_tool.get("arguments", {})
+        return any(
+            p.get("name") == name and p.get("arguments", {}) == arguments
+            for p in pending
+        )
+
     def _save_chat_turn(
         self,
         session: AIChatSession,
@@ -1129,8 +1140,13 @@ class AIChatCompletion(APIView):
         executed = []
         pending = []
 
-        # If the frontend confirmed a specific tool, execute only that one
+        # If the frontend confirmed a specific tool, execute only that one - and
+        # only if the assistant actually proposed it in this session
         if confirmed_tool and confirmed_tool.get("name"):
+            if not self._was_proposed(session, confirmed_tool):
+                return notify_error(
+                    "this tool call was not proposed in this session"
+                )
             name = confirmed_tool["name"]
             arguments = confirmed_tool.get("arguments", {})
             outcome = self._execute_and_log(request, name, arguments, confirmed=True)

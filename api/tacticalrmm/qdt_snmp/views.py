@@ -3,9 +3,11 @@ import datetime as dt
 import ipaddress
 import json
 import logging
+import re
 from pathlib import Path
 
 from django.conf import settings
+from django.core.cache import cache
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone as djangotime
@@ -50,6 +52,21 @@ MAX_READING_DAYS = 365
 # same code as the scheduled poll rather than a copy that can drift
 PROBE_SCRIPT = Path(__file__).resolve().parent / "probe" / "snmp_probe.py"
 DISCOVER_TIMEOUT = 120
+
+# the ip argument ends up in the probe's argv, so it must be provably a host:
+# anything else (option injection, template syntax) is rejected at the door
+_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}\.?$)[a-zA-Z0-9_]([a-zA-Z0-9_-]{0,61}[a-zA-Z0-9_])?"
+    r"(\.[a-zA-Z0-9_]([a-zA-Z0-9_-]{0,61}[a-zA-Z0-9_])?)*\.?$"
+)
+
+
+def _is_valid_host(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return bool(_HOSTNAME_RE.match(value))
 
 
 def _require(request, perm: str) -> None:
@@ -162,6 +179,8 @@ class DiscoverSnmpDevice(APIView):
         ip = str(request.data.get("ip") or "").strip()
         if not site_id or not ip:
             return notify_error("site and ip are required")
+        if not _is_valid_host(ip):
+            return notify_error("ip must be an ip address or a hostname")
         _require_site(request, site_id)
 
         try:
@@ -170,6 +189,9 @@ class DiscoverSnmpDevice(APIView):
             return notify_error("port must be an integer")
 
         community = str(request.data.get("community") or "public")
+        if community.startswith("-"):
+            # argparse would read this as a flag, not as the community value
+            return notify_error("community must not start with a dash")
         if "•" in community and request.data.get("device"):
             # the edit form shows the community masked; an unchanged value means
             # "the stored one", which only the server still has
@@ -212,7 +234,16 @@ def _run_probe(request, agent, script_args: list, secret: str = ""):
         "nushell_enable_config": settings.NUSHELL_ENABLE_CONFIG,
         "deno_default_permissions": settings.DENO_DEFAULT_PERMISSIONS,
     }
-    r = asyncio.run(agent.nats_cmd(data, timeout=DISCOVER_TIMEOUT + 5, wait=True))
+
+    # one in-flight probe run per user: each can hold a web worker for up to two
+    # minutes, so repeated clicks must not pile up into worker exhaustion
+    lock_key = f"qdt-snmp-probe-lock-{request.user.pk}"
+    if not cache.add(lock_key, 1, timeout=DISCOVER_TIMEOUT + 10):
+        return notify_error("another probe run is still in flight, wait for it")
+    try:
+        r = asyncio.run(agent.nats_cmd(data, timeout=DISCOVER_TIMEOUT + 5, wait=True))
+    finally:
+        cache.delete(lock_key)
 
     audited = dict(data)
     if secret:
@@ -275,6 +306,9 @@ class ScanSnmpSubnet(APIView):
         except (TypeError, ValueError):
             return notify_error("port must be an integer")
         community = str(request.data.get("community") or "public")
+        if community.startswith("-"):
+            # argparse would read this as a flag, not as the community value
+            return notify_error("community must not start with a dash")
 
         agent = pick_probe_agent(site_id)
         if agent is None:

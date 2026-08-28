@@ -521,6 +521,39 @@ class TestDiscoverSnmpDevice(TacticalTestCase):
     def test_malformed_port_is_rejected(self):
         self.assertEqual(self._post(port="abc").status_code, 400)
 
+    def test_ip_must_be_a_host_not_an_argument(self):
+        """The ip lands in the probe's argv; anything else is rejected at the door."""
+        for bad in ("--community", "not a host!", "{{agent.x}}", "-e"):
+            with self.subTest(ip=bad):
+                self.assertEqual(self._post(ip=bad).status_code, 400)
+
+    @patch("agents.models.Agent.nats_cmd")
+    def test_a_hostname_is_accepted(self, nats_cmd):
+        nats_cmd.return_value = {"stdout": "{}", "stderr": "", "retcode": 0}
+        r = self._post(ip="drucker.office.example")
+        self.assertEqual(r.status_code, 200)
+        data = nats_cmd.call_args.args[0]
+        self.assertIn("drucker.office.example", data["script_args"])
+
+    def test_community_must_not_look_like_a_flag(self):
+        self.assertEqual(self._post(community="-x").status_code, 400)
+
+    @patch("agents.models.Agent.nats_cmd")
+    def test_parallel_probe_runs_per_user_are_rejected(self, nats_cmd):
+        """Each run can hold a web worker for two minutes; piling up is a DoS."""
+        from django.core.cache import cache
+
+        cache.add(f"qdt-snmp-probe-lock-{self.john.pk}", 1, timeout=60)
+        try:
+            self.assertEqual(self._post().status_code, 400)
+        finally:
+            cache.delete(f"qdt-snmp-probe-lock-{self.john.pk}")
+
+        # and a finished run releases its lock, so the next one goes through
+        nats_cmd.return_value = {"stdout": "{}", "stderr": "", "retcode": 0}
+        self.assertEqual(self._post().status_code, 200)
+        self.assertEqual(self._post().status_code, 200)
+
 
 class TestScanSnmpSubnet(TacticalTestCase):
     """Subnet scans from the probe agent: same bar as discovery, since both send
@@ -552,6 +585,9 @@ class TestScanSnmpSubnet(TacticalTestCase):
     def test_invalid_or_oversized_cidr_is_rejected(self):
         self.assertEqual(self._post(cidr="not-a-subnet").status_code, 400)
         self.assertEqual(self._post(cidr="10.0.0.0/16").status_code, 400)
+
+    def test_community_must_not_look_like_a_flag(self):
+        self.assertEqual(self._post(community="-x").status_code, 400)
 
     def test_no_online_agent_is_a_400(self):
         self.agent.last_seen = None

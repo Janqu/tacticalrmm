@@ -1,4 +1,5 @@
 import json
+import re
 from abc import abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple, Union, cast
 
@@ -25,6 +26,36 @@ if TYPE_CHECKING:
 
 def get_debug_level() -> str:
     return get_core_settings().agent_debug_level
+
+
+# arguments or tool results whose keys look like secrets must not sit in the
+# audit log in the clear - the ai chat can pass anything a script takes
+_SECRET_KEY_RE = re.compile(r"key|token|password|secret|community", re.IGNORECASE)
+
+
+def _mask(value: str) -> str:
+    # same convention as core.serializers.mask_token, duplicated here because
+    # logs must not import from core (circular)
+    if not value:
+        return value
+    if len(value) <= 4:
+        return "•" * len(value)
+    return "•" * (len(value) - 4) + value[-4:]
+
+
+def scrub_secrets(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            k: (
+                _mask(v)
+                if isinstance(v, str) and _SECRET_KEY_RE.search(str(k))
+                else scrub_secrets(v)
+            )
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [scrub_secrets(v) for v in value]
+    return value
 
 
 class AuditLog(models.Model):
@@ -379,8 +410,8 @@ class AuditLog(models.Model):
             object_type=AuditObjType.AGENT if agent_id else AuditObjType.CORE,
             action=AuditActionType.AI_CHAT_TOOL,
             message=message,
-            before_value={"arguments": arguments, "confirmed": confirmed},
-            after_value=outcome,
+            before_value={"arguments": scrub_secrets(arguments), "confirmed": confirmed},
+            after_value=scrub_secrets(outcome),
             debug_info=debug_info,
         )
 

@@ -682,9 +682,9 @@ class TestAIChatCompletion(TacticalTestCase):
         self.setup_coresettings()
         self.authenticate()
 
-        from core.views import AIChatCompletion
+        from django.core.cache import cache
 
-        AIChatCompletion._rate_limit_bucket.clear()
+        cache.delete(f"ai-chat-rate-{self.john.pk}")
 
         core = get_core_settings()
         core.open_ai_token = "test-llm-token"
@@ -778,27 +778,37 @@ class TestAIChatCompletion(TacticalTestCase):
             AuditLog.objects.filter(action=AuditActionType.AI_CHAT_TOOL).exists()
         )
 
-    def test_confirmed_tool_executes_and_is_audited_as_confirmed(self):
-        llm_turns = [
-            '<tool_call>{"name": "run_command", "arguments": {"agent_id": "abc", "command": "whoami"}}</tool_call>',
-            "Befehl läuft",
-        ]
-        client = self._fake_http_client({"ok": True})
+    def _propose_and_confirm(self, tool_name, arguments, client):
+        """The real flow: the llm proposes a write tool (goes to pending), then
+        the user confirms exactly that call in the same session."""
+        proposal = (
+            f'<tool_call>{{"name": "{tool_name}", "arguments": '
+            f"{json.dumps(arguments)}}}</tool_call>"
+        )
+        with patch("core.views.AIChatCompletion._call_llm", return_value=proposal):
+            r1 = self._post()
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(r1.data["pending_tool_calls"][0]["name"], tool_name)
 
         with (
-            patch("core.views.AIChatCompletion._call_llm", side_effect=llm_turns),
+            patch(
+                "core.views.AIChatCompletion._call_llm",
+                side_effect=[proposal, "fertig"],
+            ),
             patch("qdt_mcp.server.httpx.AsyncClient", return_value=client),
         ):
-            r = self._post(
-                confirmed_tool={
-                    "name": "run_command",
-                    "arguments": {
-                        "agent_id": "abc",
-                        "command": "whoami",
-                        "shell": "powershell",
-                    },
-                }
+            return self._post(
+                session_id=r1.data["session_id"],
+                confirmed_tool={"name": tool_name, "arguments": arguments},
             )
+
+    def test_confirmed_tool_executes_and_is_audited_as_confirmed(self):
+        client = self._fake_http_client({"ok": True})
+        r = self._propose_and_confirm(
+            "run_command",
+            {"agent_id": "abc", "command": "whoami", "shell": "powershell"},
+            client,
+        )
 
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.data["executed_tools"][0]["name"], "run_command")
@@ -814,16 +824,68 @@ class TestAIChatCompletion(TacticalTestCase):
         entry = AuditLog.objects.get(action="ai_chat_tool")
         self.assertTrue(entry.before_value["confirmed"])
 
-    def test_unknown_confirmed_tool_is_an_error_outcome_not_a_500(self):
-        llm_turns = [
-            '<tool_call>{"name": "no_such_tool", "arguments": {}}</tool_call>',
-            "ok",
-        ]
-        with patch("core.views.AIChatCompletion._call_llm", side_effect=llm_turns):
+    def test_confirming_a_tool_that_was_not_proposed_is_rejected(self):
+        """Otherwise "confirmed" is just a direct execution api for whatever the
+        client makes up."""
+        client = self._fake_http_client({"ok": True})
+        r = self._propose_and_confirm(
+            "run_command",
+            {"agent_id": "abc", "command": "whoami", "shell": "powershell"},
+            client,
+        )
+        self.assertEqual(r.status_code, 200)
+
+        # same session, but a command the assistant never proposed
+        with patch(
+            "core.views.AIChatCompletion._call_llm",
+            side_effect=[
+                '<tool_call>{"name": "run_command", "arguments": {}}</tool_call>',
+                "fertig",
+            ],
+        ):
             r = self._post(
-                confirmed_tool={"name": "no_such_tool", "arguments": {}}
+                session_id=r.data["session_id"],
+                confirmed_tool={
+                    "name": "run_command",
+                    "arguments": {
+                        "agent_id": "abc",
+                        "command": "format c:",
+                        "shell": "powershell",
+                    },
+                },
             )
+        self.assertEqual(r.status_code, 400)
+
+    def test_secret_arguments_are_masked_in_the_audit_log(self):
+        client = self._fake_http_client({"id": 1})
+        r = self._propose_and_confirm(
+            "create_snmp_device",
+            {
+                "site_id": 1,
+                "name": "Drucker",
+                "ip": "10.0.0.1",
+                "community": "supersecret",
+            },
+            client,
+        )
+        self.assertEqual(r.status_code, 200)
+
+        from logs.models import AuditLog
+
+        entry = AuditLog.objects.get(action="ai_chat_tool")
+        self.assertNotIn("supersecret", str(entry.before_value))
+        self.assertIn("cret", str(entry.before_value))
+
+    def test_unknown_confirmed_tool_is_an_error_outcome_not_a_500(self):
+        client = self._fake_http_client()
+        r = self._propose_and_confirm("no_such_tool", {}, client)
 
         self.assertEqual(r.status_code, 200)
         outcome = r.data["executed_tools"][0]["outcome"]
         self.assertFalse(outcome["ok"])
+
+    def test_rate_limit_is_enforced(self):
+        from django.core.cache import cache
+
+        cache.set(f"ai-chat-rate-{self.john.pk}", 30, timeout=60)
+        self.assertEqual(self._post().status_code, 400)
