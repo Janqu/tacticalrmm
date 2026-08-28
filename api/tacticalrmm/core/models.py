@@ -680,6 +680,9 @@ class AIChatSession(models.Model):
 
 
 class AIChatMessage(models.Model):
+    # explicit bigint pk: migration 0055 created it as BigAutoField while
+    # DEFAULT_AUTO_FIELD is AutoField, which would otherwise read as drift
+    id = models.BigAutoField(primary_key=True)
     ROLE_CHOICES = [
         ("system", "System"),
         ("user", "User"),
