@@ -17,7 +17,8 @@ from packaging import version as pyver
 from rest_framework import serializers
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -856,6 +857,33 @@ def install_agent(request):
             response = HttpResponse(fp.read(), content_type="text/plain")
             response["Content-Disposition"] = "attachment; filename=rmm-installer.ps1"
             return response
+
+
+class FreebsdAgentDownload(APIView):
+    """
+    agents.tacticalrmm.com (upstream's agent CDN) has no freebsd build, so
+    the freebsd install script downloads from here instead. AllowAny +
+    the codesign token because this is hit unauthenticated, straight from
+    the install script on a box that isn't a TRMM agent yet — same trust
+    model as the existing NginxRedirect asset download.
+    """
+
+    permission_classes = (AllowAny,)
+
+    def get(self, request: Request, goarch: str) -> HttpResponse:
+        from core.utils import token_is_valid
+
+        codetoken, is_valid = token_is_valid()
+        if not is_valid or request.query_params.get("token") != codetoken:
+            raise PermissionDenied()
+
+        filename = f"tacticalagent-v{settings.LATEST_AGENT_VER}-freebsd-{goarch}"
+        if not (settings.FREEBSD_AGENT_DIR / filename).exists():
+            return notify_error(f"No freebsd build published for arch '{goarch}'")
+
+        response = HttpResponse(status=200)
+        response["X-Accel-Redirect"] = f"/private/freebsd_agent/{filename}"
+        return response
 
 
 @api_view(["POST"])

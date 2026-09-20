@@ -14,6 +14,7 @@ from checks.models import CheckResult
 from core.utils import get_core_settings, get_mesh_device_id, get_mesh_ws_url
 from tacticalrmm.constants import (
     AGENT_DEFER,
+    AgentPlat,
     AlertSeverity,
     CheckStatus,
     CheckType,
@@ -24,6 +25,14 @@ from tacticalrmm.helpers import notify_error
 
 def get_agent_url(*, goarch: str, plat: str, token: str = "") -> str:
     ver = settings.LATEST_AGENT_VER
+
+    # amidaware's agent CDN (AGENTS_URL, below) has no freebsd build and
+    # never will — it's not an official target. We host our own build
+    # instead; see agents.views.FreebsdAgentDownload.
+    if plat == AgentPlat.FREEBSD:
+        api = settings.ALLOWED_HOSTS[0]
+        return f"https://{api}/agents/freebsd-agent/{goarch}/?token={token}"
+
     if token:
         params = {
             "version": ver,

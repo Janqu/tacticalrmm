@@ -18,6 +18,10 @@ EXE_DIR = os.path.join(BASE_DIR, "tacticalrmm/private/exe")
 
 LINUX_AGENT_SCRIPT = BASE_DIR / "core" / "agent_linux.sh"
 FREEBSD_AGENT_SCRIPT = BASE_DIR / "core" / "agent_freebsd.sh"
+# not code-signed / not on agents.tacticalrmm.com (upstream's CDN has no
+# freebsd build) — served ourselves via nginx's internal /private/ location,
+# see agents.views.FreebsdAgentDownload
+FREEBSD_AGENT_DIR = BASE_DIR / "tacticalrmm/private/freebsd_agent"
 
 MAC_UNINSTALL = BASE_DIR / "core" / "mac_uninstall.sh"
 

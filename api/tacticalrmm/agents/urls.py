@@ -46,6 +46,7 @@ urlpatterns = [
     path("versions/", views.get_agent_versions),
     path("update/", views.update_agents),
     path("installer/", views.install_agent),
+    path("freebsd-agent/<str:goarch>/", views.FreebsdAgentDownload.as_view()),
     path("bulkrecovery/", views.bulk_agent_recovery),
     path("scripthistory/", views.ScriptRunHistory.as_view()),
     path("<agent:agent_id>/wol/", views.wol),
