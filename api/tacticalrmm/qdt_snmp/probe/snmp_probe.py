@@ -4,7 +4,7 @@
 Upload this into the Script Manager (shell: python) and run it from an automated
 task on one agent per site, with arguments:
 
-    --url https://api.example.com --agent-id {{agent.agent_id}} --api-key {{global.snmp_api_key}}
+    --url https://api.example.com --agent-id {{agent.agent_id}} --api-key {{agent.snmp_probe_key}}
 
 It asks the server which devices belong to its own site, polls them, and posts the
 readings back. Standard library only on purpose: the agent ships a bare Python with

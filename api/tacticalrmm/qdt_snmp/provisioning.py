@@ -1,25 +1,19 @@
-"""Set up the polling side of a site without any hand holding.
-
-Creating the first SNMP device at a site used to mean four manual steps: upload the
-probe script, create an API key, store it as {{global.snmp_api_key}}, and build an
-automated task on one of the site's agents. All four are mechanical, so they happen
-here instead - once when the first device is added, and again whenever someone asks
-to repair or refresh the setup.
-"""
+"""Provision a site poller with a credential bound to its assigned agent."""
 
 import logging
 from pathlib import Path
 
+from django.db import transaction
 from django.utils import timezone as djangotime
-from django.utils.crypto import get_random_string
 
-from accounts.models import APIKey, Role, User
 from agents.models import Agent
 from autotasks.models import AutomatedTask
 from autotasks.tasks import create_win_task_schedule
-from core.models import GlobalKVStore
+from clients.models import Site
 from scripts.models import Script
 from tacticalrmm.constants import AGENT_STATUS_ONLINE, ScriptShell, TaskType
+
+from .models import SnmpProbeCredential, new_probe_key
 
 logger = logging.getLogger("trmm")
 
@@ -30,10 +24,6 @@ PROBE_SCRIPT = Path(__file__).resolve().parent / "probe" / "snmp_probe.py"
 SCRIPT_NAME = "QDT SNMP Poller"
 SCRIPT_CATEGORY = "QDT"
 TASK_NAME = "QDT SNMP Poller"
-KEY_STORE_NAME = "snmp_api_key"
-API_KEY_NAME = "snmp-probe"
-SERVICE_USERNAME = "snmp-probe"
-SERVICE_ROLE_NAME = "snmp-probe"
 
 POLL_MINUTES = 5
 TASK_TIMEOUT = 300
@@ -91,56 +81,15 @@ def ensure_script() -> Script:
     return script
 
 
-def _service_user():
-    """A dedicated, login-blocked user for the probe key.
-
-    The key only ever calls GET/POST /qdt_snmp/probe/<agent>/devices/, so it gets a
-    role with exactly can_list_sites instead of inheriting the entire permission
-    set of whichever admin happened to provision first. is_active must stay True
-    because the API-key authenticator rejects inactive users; login is blocked by
-    the unusable password and block_dashboard_login instead.
-    """
-    role, _ = Role.objects.get_or_create(
-        name=SERVICE_ROLE_NAME, defaults={"can_list_sites": True}
+def ensure_probe_credential(site, agent) -> SnmpProbeCredential:
+    credential, created = SnmpProbeCredential.objects.get_or_create(
+        site=site, defaults={"agent": agent}
     )
-    if not role.can_list_sites:
-        # someone reused the role name; the probe cannot work without this
-        role.can_list_sites = True
-        role.save(update_fields=["can_list_sites"])
-
-    user, created = User.objects.get_or_create(
-        username=SERVICE_USERNAME,
-        defaults={"role": role, "block_dashboard_login": True, "email": ""},
-    )
-    if created:
-        user.set_unusable_password()
-        user.save(update_fields=["password"])
-    return user
-
-
-def ensure_api_key() -> None:
-    """The probe authenticates with {{global.snmp_api_key}}.
-
-    The key value never leaves the server; it is substituted into the script args
-    server-side on every run. get_or_create everywhere so a concurrent first
-    provision degrades to sharing the existing rows instead of failing.
-    """
-    if GlobalKVStore.objects.filter(name=KEY_STORE_NAME).exists():
-        return
-
-    api_key, _ = APIKey.objects.get_or_create(
-        name=API_KEY_NAME,
-        defaults={
-            "key": get_random_string(length=32).upper(),
-            "user": _service_user(),
-        },
-    )
-    # no unique constraint on name here (upstream model), so a true race can still
-    # produce a duplicate row; in practice the APIKey get_or_create above funnels
-    # concurrent runs onto the same key
-    GlobalKVStore.objects.get_or_create(
-        name=KEY_STORE_NAME, defaults={"value": api_key.key}
-    )
+    if not created and credential.agent_id != agent.pk:
+        credential.agent = agent
+        credential.key = new_probe_key()
+        credential.save(update_fields=["agent", "key"])
+    return credential
 
 
 def _task_actions(script: Script, api_url: str) -> list:
@@ -156,7 +105,7 @@ def _task_actions(script: Script, api_url: str) -> list:
                 "--agent-id",
                 "{{agent.agent_id}}",
                 "--api-key",
-                "{{global.snmp_api_key}}",
+                "{{agent.snmp_probe_key}}",
             ],
             "env_vars": [],
         }
@@ -167,9 +116,7 @@ def ensure_task(site, script: Script, api_url: str) -> AutomatedTask:
     """One poller task per site, repaired rather than duplicated when it exists."""
     agent = pick_probe_agent(site.pk)
     if agent is None:
-        raise NoProbeAgentError(
-            f"no online agent at {site.name} to run the poller on"
-        )
+        raise NoProbeAgentError(f"no online agent at {site.name} to run the poller on")
 
     actions = _task_actions(script, api_url)
     task = AutomatedTask.objects.filter(name=TASK_NAME, agent__site=site).first()
@@ -200,7 +147,8 @@ def ensure_task(site, script: Script, api_url: str) -> AutomatedTask:
         if changed:
             task.save(update_fields=[*changed, "modified_time"])
 
-    create_win_task_schedule.delay(pk=task.pk)
+    ensure_probe_credential(site, task.agent)
+    transaction.on_commit(lambda: create_win_task_schedule.delay(pk=task.pk))
     return task
 
 
@@ -209,8 +157,10 @@ def probe_task_exists(site) -> bool:
 
 
 def ensure_probe_for_site(*, site, api_url: str) -> None:
-    ensure_api_key()
-    ensure_task(site, ensure_script(), api_url.rstrip("/"))
+    with transaction.atomic():
+        # Serialize concurrent provisioning requests for this site.
+        site = Site.objects.select_for_update().get(pk=site.pk)
+        ensure_task(site, ensure_script(), api_url.rstrip("/"))
 
 
 def probe_status(site) -> dict:
@@ -224,7 +174,13 @@ def probe_status(site) -> dict:
         "script": Script.objects.filter(
             name=SCRIPT_NAME, category=SCRIPT_CATEGORY
         ).exists(),
-        "api_key": GlobalKVStore.objects.filter(name=KEY_STORE_NAME).exists(),
+        "api_key": (
+            SnmpProbeCredential.objects.filter(
+                site=site, agent__site=site, agent_id=task.agent_id
+            ).exists()
+            if task
+            else False
+        ),
         "online_agent": agent.hostname if agent else None,
         "task": (
             {"enabled": task.enabled, "agent": task.agent.hostname} if task else None
