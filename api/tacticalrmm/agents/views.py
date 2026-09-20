@@ -780,6 +780,18 @@ def install_agent(request):
             download_url=download_url,
         )
 
+    elif request.data["installMethod"] == "freebsd":
+        from agents.utils import generate_freebsd_install
+
+        return generate_freebsd_install(
+            client=str(client_id),
+            site=str(site_id),
+            agent_type=request.data["agenttype"],
+            token=token,
+            api=request.data["api"],
+            download_url=download_url,
+        )
+
     elif request.data["installMethod"] in {"manual", "mac"}:
         resp = {}
         if request.data["installMethod"] == "manual":

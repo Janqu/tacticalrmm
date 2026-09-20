@@ -17,6 +17,7 @@ LOG_DIR = os.path.join(BASE_DIR, "tacticalrmm/private/log")
 EXE_DIR = os.path.join(BASE_DIR, "tacticalrmm/private/exe")
 
 LINUX_AGENT_SCRIPT = BASE_DIR / "core" / "agent_linux.sh"
+FREEBSD_AGENT_SCRIPT = BASE_DIR / "core" / "agent_freebsd.sh"
 
 MAC_UNINSTALL = BASE_DIR / "core" / "mac_uninstall.sh"
 

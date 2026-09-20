@@ -125,6 +125,7 @@ class AgentPlat(models.TextChoices):
     WINDOWS = "windows", "Windows"
     LINUX = "linux", "Linux"
     DARWIN = "darwin", "macOS"
+    FREEBSD = "freebsd", "FreeBSD"
 
 
 class ClientTreeSort(models.TextChoices):

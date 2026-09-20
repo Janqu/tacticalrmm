@@ -88,6 +88,38 @@ def generate_linux_install(
         )
 
 
+def generate_freebsd_install(
+    client: str,
+    site: str,
+    agent_type: str,
+    token: str,
+    api: str,
+    download_url: str,
+) -> FileResponse:
+    # no mesh agent on freebsd yet — the rc.d service is set up by the
+    # agent binary itself (install.go), so no service unit template
+    # needs substituting here either.
+    text = Path(settings.FREEBSD_AGENT_SCRIPT).read_text()
+
+    replace = {
+        "agentDLChange": download_url,
+        "clientIDChange": client,
+        "siteIDChange": site,
+        "agentTypeChange": agent_type,
+        "tokenChange": token,
+        "apiURLChange": api,
+    }
+
+    for i, j in replace.items():
+        text = text.replace(i, j)
+
+    text += "\n"
+    with StringIO(text) as fp:
+        return FileResponse(
+            fp.read(), as_attachment=True, filename="freebsd_agent_install.sh"
+        )
+
+
 def get_validated_agent(agent_id, min_version="2.10.0"):
     from .models import Agent
 
