@@ -16,7 +16,6 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from agents.models import Agent
 from clients.models import Site
 from core.serializers import mask_token
 from logs.models import AuditLog
@@ -24,7 +23,8 @@ from tacticalrmm.helpers import notify_error
 from tacticalrmm.permissions import _has_perm, _has_perm_on_agent, _has_perm_on_site
 
 from .alerting import evaluate
-from .models import SnmpAlert, SnmpDevice, SnmpReading
+from .authentication import SnmpProbeAuthentication
+from .models import SnmpAlert, SnmpDevice, SnmpProbeCredential, SnmpReading
 from .provisioning import (
     NoProbeAgentError,
     ensure_probe_for_site,
@@ -142,13 +142,13 @@ class GetUpdateDeleteSnmpDevice(APIView):
         return device
 
     def get(self, request, pk):
-        return Response(
-            SnmpDeviceSerializer(self._get(request, pk, READ_PERM)).data
-        )
+        return Response(SnmpDeviceSerializer(self._get(request, pk, READ_PERM)).data)
 
     def put(self, request, pk):
         device = self._get(request, pk, WRITE_PERM)
-        serializer = SnmpDeviceSerializer(instance=device, data=request.data, partial=True)
+        serializer = SnmpDeviceSerializer(
+            instance=device, data=request.data, partial=True
+        )
         serializer.is_valid(raise_exception=True)
 
         # moving a device to a site the caller cannot see would be a way out of scope
@@ -399,8 +399,9 @@ class SnmpLatestReadings(APIView):
             SnmpReading.objects.filter(device__in=devices)
             # device_id, not device: ordering by the FK would order by the related
             # model's meta ordering and break the distinct-on match
-            .order_by("device_id", "metric", "-timestamp")
-            .distinct("device_id", "metric")
+            .order_by("device_id", "metric", "-timestamp").distinct(
+                "device_id", "metric"
+            )
         )
 
         out: dict = {}
@@ -482,9 +483,7 @@ class SnmpDeviceCounters(APIView):
                     "month": f"{year}-{month:02d}",
                     "counter": counter,
                     "pages": (
-                        None
-                        if previous is None or reset
-                        else round(counter - previous)
+                        None if previous is None or reset else round(counter - previous)
                     ),
                     "reset": reset,
                 }
@@ -498,13 +497,18 @@ class ProbeDevices(APIView):
     """What the polling script on the probe agent asks for. Scoped to that agent's
     site, so a probe can never see or write devices at another customer."""
 
+    authentication_classes = [SnmpProbeAuthentication]
     permission_classes = [IsAuthenticated]
 
     def _site_id(self, request, agent_id: str) -> int:
-        _require(request, READ_PERM)
-        if not _has_perm_on_agent(request.user, agent_id):
+        credential = request.auth
+        if (
+            not isinstance(credential, SnmpProbeCredential)
+            or credential.agent.agent_id != agent_id
+            or credential.agent.site_id != credential.site_id
+        ):
             raise PermissionDenied()
-        return get_object_or_404(Agent, agent_id=agent_id).site_id
+        return credential.site_id
 
     def get(self, request, agent_id):
         devices = SnmpDevice.objects.filter(
@@ -523,7 +527,9 @@ class ProbeDevices(APIView):
         }
         unknown = [r["id"] for r in serializer.validated_data if r["id"] not in by_id]
         if unknown:
-            return notify_error(f"unknown or disabled device ids for this site: {unknown}")
+            return notify_error(
+                f"unknown or disabled device ids for this site: {unknown}"
+            )
 
         now = djangotime.now()
         readings, raised = [], []
@@ -554,8 +560,10 @@ class ProbeDevices(APIView):
 
             SnmpReading.objects.bulk_create(readings)
 
-        return Response({
-            "devices": len(serializer.validated_data),
-            "readings": len(readings),
-            "alerts": raised,
-        })
+        return Response(
+            {
+                "devices": len(serializer.validated_data),
+                "readings": len(readings),
+                "alerts": raised,
+            }
+        )

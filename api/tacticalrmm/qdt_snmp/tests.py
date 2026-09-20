@@ -8,7 +8,7 @@ from rest_framework.exceptions import ValidationError
 
 from tacticalrmm.test import TacticalTestCase
 
-from .models import SnmpAlert, SnmpDevice, SnmpReading
+from .models import SnmpAlert, SnmpDevice, SnmpProbeCredential, SnmpReading
 from .serializers import validate_metric_map, validate_thresholds
 
 BASE = "/qdt_snmp"
@@ -25,11 +25,17 @@ class TestSnmpDevices(TacticalTestCase):
         self.site_b = baker.make("clients.Site", client=self.client_b)
 
         self.printer_a = baker.make(
-            "qdt_snmp.SnmpDevice", site=self.site_a, name="Drucker A", ip="10.0.0.10",
+            "qdt_snmp.SnmpDevice",
+            site=self.site_a,
+            name="Drucker A",
+            ip="10.0.0.10",
             community="secret-a",
         )
         self.printer_b = baker.make(
-            "qdt_snmp.SnmpDevice", site=self.site_b, name="Drucker B", ip="10.0.1.10",
+            "qdt_snmp.SnmpDevice",
+            site=self.site_b,
+            name="Drucker B",
+            ip="10.0.1.10",
             community="secret-b",
         )
 
@@ -154,6 +160,9 @@ class TestMetricMapValidation(TacticalTestCase):
         self.assertEqual(SnmpDevice.objects.get(pk=r.data["id"]).metric_map, good)
 
         agent = baker.make_recipe("agents.agent", site=self.site)
+        credential = SnmpProbeCredential.objects.create(site=self.site, agent=agent)
+        self.setup_client()
+        self.client.credentials(HTTP_X_API_KEY=credential.key)
         r = self.client.get(f"{BASE}/probe/{agent.agent_id}/devices/")
         self.assertEqual(r.data[0]["metric_map"], good)
 
@@ -210,12 +219,20 @@ class TestSnmpProbe(TacticalTestCase):
             "qdt_snmp.SnmpDevice", site=self.site_a, name="Drucker A", ip="10.0.0.10"
         )
         self.disabled = baker.make(
-            "qdt_snmp.SnmpDevice", site=self.site_a, name="Aus", ip="10.0.0.11",
+            "qdt_snmp.SnmpDevice",
+            site=self.site_a,
+            name="Aus",
+            ip="10.0.0.11",
             enabled=False,
         )
         self.printer_b = baker.make(
             "qdt_snmp.SnmpDevice", site=self.site_b, name="Drucker B", ip="10.0.1.10"
         )
+        credential = SnmpProbeCredential.objects.create(
+            site=self.site_a, agent=self.probe
+        )
+        self.setup_client()
+        self.client.credentials(HTTP_X_API_KEY=credential.key)
 
     def test_probe_only_gets_its_own_sites_enabled_devices(self):
         r = self.client.get(f"{BASE}/probe/{self.probe.agent_id}/devices/")
@@ -305,7 +322,13 @@ class TestSnmpProbe(TacticalTestCase):
                 r = self.client.post(
                     f"{BASE}/probe/{self.probe.agent_id}/devices/",
                     json.dumps(
-                        [{"id": self.printer_a.pk, "reachable": True, "metrics": metrics}]
+                        [
+                            {
+                                "id": self.printer_a.pk,
+                                "reachable": True,
+                                "metrics": metrics,
+                            }
+                        ]
                     ),
                     content_type="application/json",
                 )
@@ -324,6 +347,12 @@ class TestThresholdAlerting(TacticalTestCase):
         self.printer = baker.make(
             "qdt_snmp.SnmpDevice", site=self.site, name="Drucker", device_type="printer"
         )
+
+        credential = SnmpProbeCredential.objects.create(
+            site=self.site, agent=self.probe
+        )
+        self.setup_client()
+        self.client.credentials(HTTP_X_API_KEY=credential.key)
 
     def _ingest(self, metrics=None, reachable=True):
         return self.client.post(
@@ -403,7 +432,12 @@ class TestThresholdValidation(TacticalTestCase):
     def _post(self, thresholds):
         return self.client.post(
             f"{BASE}/devices/",
-            {"site": self.site.pk, "name": "D", "ip": "10.0.0.5", "thresholds": thresholds},
+            {
+                "site": self.site.pk,
+                "name": "D",
+                "ip": "10.0.0.5",
+                "thresholds": thresholds,
+            },
             format="json",
         )
 
@@ -479,7 +513,10 @@ class TestDiscoverSnmpDevice(TacticalTestCase):
             "host": "10.0.0.10",
             "sys_descr": "HP LaserJet",
             "suggested_metric_map": {
-                "supply.black": {"oid": "1.3.6.1.43.11.1.1.9.1.1", "max_oid": "1.3.6.1.43.11.1.1.8.1.1"},
+                "supply.black": {
+                    "oid": "1.3.6.1.43.11.1.1.9.1.1",
+                    "max_oid": "1.3.6.1.43.11.1.1.8.1.1",
+                },
             },
         }
         nats_cmd.return_value = {"stdout": json.dumps(dump), "stderr": "", "retcode": 0}
@@ -491,16 +528,15 @@ class TestDiscoverSnmpDevice(TacticalTestCase):
         data = nats_cmd.call_args.args[0]
         self.assertEqual(data["func"], "runscriptfull")
         self.assertEqual(
-            data["script_args"], ["--dump", "10.0.0.10", "--community", "public", "--port", "161"]
+            data["script_args"],
+            ["--dump", "10.0.0.10", "--community", "public", "--port", "161"],
         )
 
     @patch("agents.models.Agent.nats_cmd")
     def test_masked_community_means_the_stored_one(self, nats_cmd):
         """The edit form only ever sees the masked community; sending it back must
         probe with the real one, not with the bullets."""
-        device = baker.make(
-            "qdt_snmp.SnmpDevice", site=self.site, community="secret-a"
-        )
+        device = baker.make("qdt_snmp.SnmpDevice", site=self.site, community="secret-a")
         nats_cmd.return_value = {"stdout": "{}", "stderr": "", "retcode": 0}
 
         r = self._post(community="••••et-a", device=device.pk)
@@ -600,7 +636,11 @@ class TestScanSnmpSubnet(TacticalTestCase):
             {"ip": "10.0.0.5", "sys_descr": "HP LaserJet", "sys_name": "drucker1"},
             {"ip": "10.0.0.6", "sys_descr": "APC UPS", "sys_name": None},
         ]
-        nats_cmd.return_value = {"stdout": json.dumps(responders), "stderr": "", "retcode": 0}
+        nats_cmd.return_value = {
+            "stdout": json.dumps(responders),
+            "stderr": "",
+            "retcode": 0,
+        }
 
         r = self._post(community="secret")
         self.assertEqual(r.status_code, 200)
@@ -630,7 +670,8 @@ class TestProbeProvisioning(TacticalTestCase):
         self.agent = baker.make_recipe("agents.online_agent", site=self.site)
 
     def _post(self, site_id=None):
-        return self.client.post(f"{BASE}/sites/{site_id or self.site.pk}/probe/")
+        with self.captureOnCommitCallbacks(execute=True):
+            return self.client.post(f"{BASE}/sites/{site_id or self.site.pk}/probe/")
 
     def test_provisions_script_key_and_task(self, sched):
         r = self._post()
@@ -645,19 +686,11 @@ class TestProbeProvisioning(TacticalTestCase):
         self.assertEqual(script.shell, "python")
         self.assertIn("SNMP poller", script.script_body)
 
-        store = GlobalKVStore.objects.get(name="snmp_api_key")
-        api_key = APIKey.objects.get(name="snmp-probe")
-        self.assertEqual(store.value, api_key.key)
-
-        # the key belongs to a minimal service user, not to the provisioning admin:
-        # it may read sites and post readings, nothing else
-        service = api_key.user
-        self.assertEqual(service.username, "snmp-probe")
-        self.assertTrue(service.block_dashboard_login)
-        self.assertFalse(service.has_usable_password())
-        self.assertTrue(service.role.can_list_sites)
-        self.assertFalse(service.role.is_superuser)
-        self.assertFalse(service.role.can_run_scripts)
+        credential = SnmpProbeCredential.objects.get(site=self.site)
+        self.assertEqual(credential.agent_id, self.agent.pk)
+        self.assertEqual(len(credential.key), 64)
+        self.assertFalse(GlobalKVStore.objects.filter(name="snmp_api_key").exists())
+        self.assertFalse(APIKey.objects.filter(name="snmp-probe").exists())
 
         task = AutomatedTask.objects.get(name="QDT SNMP Poller", agent=self.agent)
         self.assertEqual(task.task_type, "daily")
@@ -671,7 +704,7 @@ class TestProbeProvisioning(TacticalTestCase):
                 "--agent-id",
                 "{{agent.agent_id}}",
                 "--api-key",
-                "{{global.snmp_api_key}}",
+                "{{agent.snmp_probe_key}}",
             ],
         )
         self.assertEqual(task.actions[0]["script"], script.pk)
@@ -751,11 +784,12 @@ class TestProbeProvisioning(TacticalTestCase):
     def test_adding_the_first_device_provisions_the_site(self, sched):
         from autotasks.models import AutomatedTask
 
-        r = self.client.post(
-            f"{BASE}/devices/",
-            {"site": self.site.pk, "name": "Drucker", "ip": "10.0.0.10"},
-            format="json",
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            r = self.client.post(
+                f"{BASE}/devices/",
+                {"site": self.site.pk, "name": "Drucker", "ip": "10.0.0.10"},
+                format="json",
+            )
         self.assertEqual(r.status_code, 200)
         self.assertNotIn("probe_warning", r.data)
         self.assertEqual(AutomatedTask.objects.count(), 1)
@@ -773,11 +807,12 @@ class TestProbeProvisioning(TacticalTestCase):
     def test_device_creation_without_online_agent_still_works(self, sched):
         self.agent.last_seen = None
         self.agent.save()
-        r = self.client.post(
-            f"{BASE}/devices/",
-            {"site": self.site.pk, "name": "Drucker", "ip": "10.0.0.10"},
-            format="json",
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            r = self.client.post(
+                f"{BASE}/devices/",
+                {"site": self.site.pk, "name": "Drucker", "ip": "10.0.0.10"},
+                format="json",
+            )
         self.assertEqual(r.status_code, 200)
         self.assertIn("probe_warning", r.data)
         sched.delay.assert_not_called()
@@ -789,11 +824,12 @@ class TestProbeProvisioning(TacticalTestCase):
         gets an automatic poller."""
         user = self.create_user_with_roles(["can_list_sites", "can_manage_sites"])
         self.client.force_authenticate(user=user)
-        r = self.client.post(
-            f"{BASE}/devices/",
-            {"site": self.site.pk, "name": "Drucker", "ip": "10.0.0.10"},
-            format="json",
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            r = self.client.post(
+                f"{BASE}/devices/",
+                {"site": self.site.pk, "name": "Drucker", "ip": "10.0.0.10"},
+                format="json",
+            )
         self.assertEqual(r.status_code, 200)
         self.assertIn("can_run_scripts", r.data["probe_warning"])
         sched.delay.assert_not_called()
@@ -817,12 +853,23 @@ class TestFleetEndpoints(TacticalTestCase):
         from django.utils import timezone as djangotime
 
         old = baker.make(
-            "qdt_snmp.SnmpReading", device=self.device_a, metric="supply.black", value=50.0
+            "qdt_snmp.SnmpReading",
+            device=self.device_a,
+            metric="supply.black",
+            value=50.0,
         )
         new = baker.make(
-            "qdt_snmp.SnmpReading", device=self.device_a, metric="supply.black", value=30.0
+            "qdt_snmp.SnmpReading",
+            device=self.device_a,
+            metric="supply.black",
+            value=30.0,
         )
-        baker.make("qdt_snmp.SnmpReading", device=self.device_b, metric="supply.cyan", value=80.0)
+        baker.make(
+            "qdt_snmp.SnmpReading",
+            device=self.device_b,
+            metric="supply.cyan",
+            value=80.0,
+        )
         # make the order unambiguous instead of relying on insert timing
         SnmpReading.objects.filter(pk=old.pk).update(
             timestamp=djangotime.now() - djangotime.timedelta(hours=1)
@@ -847,8 +894,18 @@ class TestFleetEndpoints(TacticalTestCase):
         self.assertNotIn(self.device_b.pk, r.data)
 
     def test_open_alerts_are_role_scoped(self):
-        baker.make("qdt_snmp.SnmpAlert", device=self.device_a, metric="supply.black", severity="error")
-        baker.make("qdt_snmp.SnmpAlert", device=self.device_b, metric="supply.cyan", severity="warning")
+        baker.make(
+            "qdt_snmp.SnmpAlert",
+            device=self.device_a,
+            metric="supply.black",
+            severity="error",
+        )
+        baker.make(
+            "qdt_snmp.SnmpAlert",
+            device=self.device_b,
+            metric="supply.cyan",
+            severity="warning",
+        )
 
         r = self.client.get(f"{BASE}/alerts/")
         self.assertEqual(r.status_code, 200)
@@ -877,7 +934,10 @@ class TestSnmpDeviceCounters(TacticalTestCase):
 
     def _reading(self, year, month, day, value):
         reading = baker.make(
-            "qdt_snmp.SnmpReading", device=self.device, metric="pages.total", value=value
+            "qdt_snmp.SnmpReading",
+            device=self.device,
+            metric="pages.total",
+            value=value,
         )
         SnmpReading.objects.filter(pk=reading.pk).update(
             timestamp=djangotime.datetime(year, month, day, tzinfo=djangotime.utc)

@@ -74,6 +74,17 @@ class Agent(BaseAuditModel):
 
     objects = PermissionQuerySet.as_manager()
 
+    @property
+    def snmp_probe_key(self):
+        """Resolve a poller's secret only in the context of its assigned agent."""
+        from qdt_snmp.models import SnmpProbeCredential
+
+        return (
+            SnmpProbeCredential.objects.filter(agent=self, site_id=self.site_id)
+            .values_list("key", flat=True)
+            .first()
+        )
+
     version = models.CharField(default="0.1.0", max_length=255)
     operating_system = models.CharField(null=True, blank=True, max_length=255)
     plat: "AgentPlat" = models.CharField(  # type: ignore

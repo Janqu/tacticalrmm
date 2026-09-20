@@ -5,8 +5,24 @@ polled by an agent at the same site acting as a probe, because customer devices 
 customer LANs and are not reachable from the server.
 """
 
+import secrets
+
 from django.db import models
 from django.utils import timezone as djangotime
+
+
+def new_probe_key():
+    return secrets.token_hex(32)
+
+
+class SnmpProbeCredential(models.Model):
+    """A poller credential grants access only to this agent at this site."""
+
+    site = models.OneToOneField("clients.Site", on_delete=models.CASCADE)
+    agent = models.ForeignKey("agents.Agent", on_delete=models.CASCADE)
+    key = models.CharField(
+        max_length=64, unique=True, default=new_probe_key, editable=False
+    )
 
 
 class SnmpDeviceType(models.TextChoices):
@@ -174,7 +190,11 @@ class SnmpAlert(models.Model):
     metric = models.CharField(max_length=100)
     severity = models.CharField(max_length=20)
     alert = models.ForeignKey(
-        "alerts.Alert", related_name="+", null=True, blank=True, on_delete=models.SET_NULL
+        "alerts.Alert",
+        related_name="+",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
     )
     created_time = models.DateTimeField(auto_now_add=True)
 
