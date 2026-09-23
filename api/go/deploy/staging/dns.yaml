@@ -1,0 +1,19 @@
+# Apply only after the isolated vhosts are ready on the target server.
+match:
+  zones: ["q-dt.de"]
+records:
+  - name: api2
+    type: A
+    value: "192.168.1.85"
+    ttl: 300
+    mode: ensure
+  - name: rmm2
+    type: A
+    value: "192.168.1.85"
+    ttl: 300
+    mode: ensure
+  - name: mesh2
+    type: A
+    value: "192.168.1.85"
+    ttl: 300
+    mode: ensure

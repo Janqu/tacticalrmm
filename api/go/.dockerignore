@@ -1,0 +1,8 @@
+.env*
+deploy/
+tools/
+contracts/
+*.md
+!LICENSE.md
+**/*_test.go
+**/testdata/

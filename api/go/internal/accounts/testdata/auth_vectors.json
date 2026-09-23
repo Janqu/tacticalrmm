@@ -1,0 +1,282 @@
+{
+  "passwords": [
+    {
+      "password": " pässword🔑 longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong",
+      "encoded": "pbkdf2_sha256$600000$abcdefghijklmnopqrstuv$a2go4IGB3HRFeMbiLuQSIkB3BPUxZSA1ZyRHY9BbyZk=",
+      "valid": true,
+      "upgrade": false
+    },
+    {
+      "password": "pässword🔑 longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong",
+      "encoded": "pbkdf2_sha256$600000$abcdefghijklmnopqrstuv$a2go4IGB3HRFeMbiLuQSIkB3BPUxZSA1ZyRHY9BbyZk=",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": "wrong",
+      "encoded": "pbkdf2_sha256$600000$abcdefghijklmnopqrstuv$a2go4IGB3HRFeMbiLuQSIkB3BPUxZSA1ZyRHY9BbyZk=",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": "",
+      "encoded": "pbkdf2_sha256$600000$abcdefghijklmnopqrstuv$a2go4IGB3HRFeMbiLuQSIkB3BPUxZSA1ZyRHY9BbyZk=",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": " pässword🔑 longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong",
+      "encoded": "pbkdf2_sha256$12000$short$zeYIN+R/zzvmo54qa5Owipy4Xhsf+eTBr/RXzmNhiyk=",
+      "valid": true,
+      "upgrade": true
+    },
+    {
+      "password": "pässword🔑 longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong",
+      "encoded": "pbkdf2_sha256$12000$short$zeYIN+R/zzvmo54qa5Owipy4Xhsf+eTBr/RXzmNhiyk=",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": "wrong",
+      "encoded": "pbkdf2_sha256$12000$short$zeYIN+R/zzvmo54qa5Owipy4Xhsf+eTBr/RXzmNhiyk=",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": "",
+      "encoded": "pbkdf2_sha256$12000$short$zeYIN+R/zzvmo54qa5Owipy4Xhsf+eTBr/RXzmNhiyk=",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": " pässword🔑 longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong",
+      "encoded": "pbkdf2_sha256$720000$abcdefghijklmnopqrstuv$OQ8TnJhEDyYRg2SvYbdospJ5eU2PbXwUWmzxFxGgIbc=",
+      "valid": true,
+      "upgrade": true
+    },
+    {
+      "password": "pässword🔑 longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong",
+      "encoded": "pbkdf2_sha256$720000$abcdefghijklmnopqrstuv$OQ8TnJhEDyYRg2SvYbdospJ5eU2PbXwUWmzxFxGgIbc=",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": "wrong",
+      "encoded": "pbkdf2_sha256$720000$abcdefghijklmnopqrstuv$OQ8TnJhEDyYRg2SvYbdospJ5eU2PbXwUWmzxFxGgIbc=",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": "",
+      "encoded": "pbkdf2_sha256$720000$abcdefghijklmnopqrstuv$OQ8TnJhEDyYRg2SvYbdospJ5eU2PbXwUWmzxFxGgIbc=",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": " pässword🔑 longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong",
+      "encoded": "pbkdf2_sha1$600000$abcdefghijklmnopqrstuv$M+93McH+C8aUlqv/FmHXRG/BH94=",
+      "valid": true,
+      "upgrade": true
+    },
+    {
+      "password": "pässword🔑 longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong",
+      "encoded": "pbkdf2_sha1$600000$abcdefghijklmnopqrstuv$M+93McH+C8aUlqv/FmHXRG/BH94=",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": "wrong",
+      "encoded": "pbkdf2_sha1$600000$abcdefghijklmnopqrstuv$M+93McH+C8aUlqv/FmHXRG/BH94=",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": "",
+      "encoded": "pbkdf2_sha1$600000$abcdefghijklmnopqrstuv$M+93McH+C8aUlqv/FmHXRG/BH94=",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": " pässword🔑 longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong",
+      "encoded": "argon2$argon2id$v=19$m=102400,t=2,p=8$YWJjZGVmZ2hpamtsbW5vcHFyc3R1dg$Men+CVRP0ksVTrf36V+n6LWTBC4tkmMfEMOyfKtdWzE",
+      "valid": true,
+      "upgrade": true
+    },
+    {
+      "password": "pässword🔑 longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong",
+      "encoded": "argon2$argon2id$v=19$m=102400,t=2,p=8$YWJjZGVmZ2hpamtsbW5vcHFyc3R1dg$Men+CVRP0ksVTrf36V+n6LWTBC4tkmMfEMOyfKtdWzE",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": "wrong",
+      "encoded": "argon2$argon2id$v=19$m=102400,t=2,p=8$YWJjZGVmZ2hpamtsbW5vcHFyc3R1dg$Men+CVRP0ksVTrf36V+n6LWTBC4tkmMfEMOyfKtdWzE",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": "",
+      "encoded": "argon2$argon2id$v=19$m=102400,t=2,p=8$YWJjZGVmZ2hpamtsbW5vcHFyc3R1dg$Men+CVRP0ksVTrf36V+n6LWTBC4tkmMfEMOyfKtdWzE",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": " pässword🔑 longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong",
+      "encoded": "bcrypt_sha256$$2b$12$abcdefghijklmnopqrstuudlBlIEQJG.em1ZCGTRWX30FlwBA6FTS",
+      "valid": true,
+      "upgrade": true
+    },
+    {
+      "password": "pässword🔑 longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong",
+      "encoded": "bcrypt_sha256$$2b$12$abcdefghijklmnopqrstuudlBlIEQJG.em1ZCGTRWX30FlwBA6FTS",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": "wrong",
+      "encoded": "bcrypt_sha256$$2b$12$abcdefghijklmnopqrstuudlBlIEQJG.em1ZCGTRWX30FlwBA6FTS",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": "",
+      "encoded": "bcrypt_sha256$$2b$12$abcdefghijklmnopqrstuudlBlIEQJG.em1ZCGTRWX30FlwBA6FTS",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": " pässword🔑 longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong",
+      "encoded": "scrypt$16384$abcdefghijklmnopqrstuv$8$1$inlNSh073YPguywOJkPpXj/6qtkdxQwt63x2gLSxGKLfXtIO8y7e7vjL5aE/Pj+l7oCeKXA32Bq/T5h3qUZk5Q==",
+      "valid": true,
+      "upgrade": true
+    },
+    {
+      "password": "pässword🔑 longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong",
+      "encoded": "scrypt$16384$abcdefghijklmnopqrstuv$8$1$inlNSh073YPguywOJkPpXj/6qtkdxQwt63x2gLSxGKLfXtIO8y7e7vjL5aE/Pj+l7oCeKXA32Bq/T5h3qUZk5Q==",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": "wrong",
+      "encoded": "scrypt$16384$abcdefghijklmnopqrstuv$8$1$inlNSh073YPguywOJkPpXj/6qtkdxQwt63x2gLSxGKLfXtIO8y7e7vjL5aE/Pj+l7oCeKXA32Bq/T5h3qUZk5Q==",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": "",
+      "encoded": "scrypt$16384$abcdefghijklmnopqrstuv$8$1$inlNSh073YPguywOJkPpXj/6qtkdxQwt63x2gLSxGKLfXtIO8y7e7vjL5aE/Pj+l7oCeKXA32Bq/T5h3qUZk5Q==",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": " pässword🔑 longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong",
+      "encoded": "",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": " pässword🔑 longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong",
+      "encoded": "!unusable",
+      "valid": false,
+      "upgrade": false
+    },
+    {
+      "password": " pässword🔑 longlonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglonglong",
+      "encoded": "md5$salt$invalid",
+      "valid": false,
+      "upgrade": false
+    }
+  ],
+  "totp": [
+    {
+      "secret": "JBSWY3DPEHPK3PXP",
+      "token": "187940",
+      "at": 1700000010,
+      "valid": false
+    },
+    {
+      "secret": "JBSWY3DPEHPK3PXP",
+      "token": "866854",
+      "at": 1700000010,
+      "valid": true
+    },
+    {
+      "secret": "JBSWY3DPEHPK3PXP",
+      "token": "324550",
+      "at": 1700000010,
+      "valid": true
+    },
+    {
+      "secret": "JBSWY3DPEHPK3PXP",
+      "token": "367665",
+      "at": 1700000010,
+      "valid": true
+    },
+    {
+      "secret": "JBSWY3DPEHPK3PXP",
+      "token": "870960",
+      "at": 1700000010,
+      "valid": true
+    },
+    {
+      "secret": "JBSWY3DPEHPK3PXP",
+      "token": "884244",
+      "at": 1700000010,
+      "valid": true
+    },
+    {
+      "secret": "JBSWY3DPEHPK3PXP",
+      "token": "519640",
+      "at": 1700000010,
+      "valid": false
+    },
+    {
+      "secret": "JBSWY3DPEHPK3PXP",
+      "token": "３６７６６５",
+      "at": 1700000010,
+      "valid": true
+    },
+    {
+      "secret": "JBSWY3DPEHPK3PXP",
+      "token": " 367665",
+      "at": 1700000010,
+      "valid": false
+    },
+    {
+      "secret": "JBSWY3DPEHPK3PXP",
+      "token": "000000",
+      "at": 1700000010,
+      "valid": false
+    },
+    {
+      "secret": "JBSWY3DPEHPK3PXP",
+      "token": "",
+      "at": 1700000010,
+      "valid": false
+    },
+    {
+      "secret": "JBSWY3DPEHPK3PXP",
+      "token": "1234567",
+      "at": 1700000010,
+      "valid": false
+    },
+    {
+      "secret": "jbswy3dpehpk3pxp",
+      "token": "367665",
+      "at": 1700000010,
+      "valid": true
+    },
+    {
+      "secret": "MZXW6===",
+      "token": "553209",
+      "at": 1700000010,
+      "valid": true
+    },
+    {
+      "secret": "mzxw6",
+      "token": "553209",
+      "at": 1700000010,
+      "valid": true
+    }
+  ]
+}

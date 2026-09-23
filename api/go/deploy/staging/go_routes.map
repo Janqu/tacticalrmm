@@ -1,0 +1,102 @@
+# STAGING ONLY: include in nginx's http {} context, not server/location {}.
+# Front proxy :18081 -> Go :18082 / Django :18083 (loopback listeners).
+# Selection is by exact method and normalized URI, without query arguments.
+# Keep the original request URI/query when forwarding, e.g. in the API location:
+#   proxy_pass http://$trmm_staging_backend$request_uri;
+#   proxy_next_upstream off;
+#   proxy_intercept_errors off;
+#   proxy_read_timeout 205s;
+# Preserve Authorization, Cookie, Set-Cookie, Host and trusted proxy headers.
+# NEVER use error_page/upstream retry to send Go 404/501/5xx to Django: a
+# command or DB mutation may already have occurred. Unsupported stays explicit.
+# This file does not route the frontend, static assets or WebSockets to Go.
+#
+# Mixed sessions require the SAME staging database, Django SECRET_KEY (Go
+# DJANGO_SECRET_KEY), session/CSRF cookie names/domain and HTTPS policy. Go
+# login writes Django-readable DB sessions and Knox tokens. Supply REDIS_URL
+# for Go login throttling; Go/Django login attempt budgets are not shared.
+# Keep one public origin and forward cookies without rewriting their domain.
+# Never point either staging backend at the production database or agent bus.
+#
+# IMPORTANT: runscript + histresult are a coupled staging opt-in. Supported
+# output modes: wait, forget, note, collector, note_async. Email/server-side
+# execution is still unsupported (501). Apply Go migration 002 before using
+# note_async. All PATCH history callbacks below go to Go: legacy note/task or
+# combined collector+note histories can return 501, not fall back to Django.
+# Once note_async histories exist, keep their callbacks on Go through rollback
+# or fence/drain them first: Django would create another note on every replay.
+# Other agent API/enrollment/callback endpoints intentionally remain Django.
+
+map "$request_method:$uri" $trmm_staging_backend {
+    default 127.0.0.1:18083;
+
+    # Authentication and account administration.
+    "~^POST:/(v2/(checkcreds|login)|logout|logoutall)/$" 127.0.0.1:18082;
+    "~^(GET|HEAD|POST):/accounts/(users|roles|apikeys)/$" 127.0.0.1:18082;
+    "~^(GET|HEAD|PUT|DELETE):/accounts/[0-9]+/users/$" 127.0.0.1:18082;
+    "~^(GET|HEAD|PUT|DELETE):/accounts/roles/[0-9]+/$" 127.0.0.1:18082;
+    "~^(PUT|DELETE):/accounts/apikeys/[0-9]+/$" 127.0.0.1:18082;
+    "~^(GET|HEAD|DELETE):/accounts/users/[0-9]+/sessions/$" 127.0.0.1:18082;
+    "~^DELETE:/accounts/sessions/[^/]+/$" 127.0.0.1:18082;
+    "~^PATCH:/accounts/users/ui/$" 127.0.0.1:18082;
+    "~^PUT:/accounts/(resetpw|reset2fa)/$" 127.0.0.1:18082;
+    "~^POST:/accounts/users/setup_totp/$" 127.0.0.1:18082;
+    "~^(POST|PUT):/accounts/users/(reset|reset_totp)/$" 127.0.0.1:18082;
+
+    # Clients, sites and core settings. SSO and OPTIONS remain Django.
+    "~^(GET|HEAD|POST):/clients/(sites/)?$" 127.0.0.1:18082;
+    "~^(GET|HEAD|PUT|DELETE):/clients/(sites/)?[0-9]+/$" 127.0.0.1:18082;
+    "~^GET:/core/version/$" 127.0.0.1:18082;
+    "~^(GET|HEAD|PUT):/core/settings/$" 127.0.0.1:18082;
+    "~^(GET|HEAD|POST):/core/(urlaction|keystore)/$" 127.0.0.1:18082;
+    "~^(PUT|DELETE):/core/(urlaction|keystore)/[0-9]+/$" 127.0.0.1:18082;
+    "~^(GET|HEAD|DELETE):/core/codesign/$" 127.0.0.1:18082;
+    "~^(GET|HEAD|POST|PATCH):/core/customfields/$" 127.0.0.1:18082;
+    "~^(GET|HEAD|PUT|DELETE):/core/customfields/[0-9]+/$" 127.0.0.1:18082;
+
+    # Agent list/history/notes. Generic agent detail/edit stays Django.
+    "~^(GET|HEAD):/agents/$" 127.0.0.1:18082;
+    "~^(GET|HEAD):/agents/(v2/)?history/$" 127.0.0.1:18082;
+    "~^(GET|HEAD):/agents/(v2/)?[^/]{21,}/history/$" 127.0.0.1:18082;
+    "~^(GET|HEAD|POST):/agents/notes/$" 127.0.0.1:18082;
+    "~^(GET|HEAD|PUT|DELETE):/agents/notes/[0-9]+/$" 127.0.0.1:18082;
+    "~^(GET|HEAD):/agents/scripthistory/$" 127.0.0.1:18082;
+    "~^GET:/agents/versions/$" 127.0.0.1:18082;
+    "~^(GET|HEAD):/agents/[^/]{21,}/(notes|checks|tasks|pendingactions|terminal-defaults|processes)/$" 127.0.0.1:18082;
+    "~^GET:/agents/[^/]{21,}/(ping|registry)/$" 127.0.0.1:18082;
+    "~^GET:/agents/[^/]{21,}/eventlog/[^/]+/[0-9]+/$" 127.0.0.1:18082;
+
+    # Script CRUD and explicitly paired execution/results.
+    "~^(GET|HEAD|POST):/scripts/(snippets/)?$" 127.0.0.1:18082;
+    "~^(GET|HEAD|PUT|DELETE):/scripts/(snippets/)?[0-9]+/$" 127.0.0.1:18082;
+    "~^POST:/agents/[^/]{21,}/(cmd|runscript)/$" 127.0.0.1:18082;
+    "~^PATCH:/api/v3/[0-9]+/[^/]{21,}/histresult/$" 127.0.0.1:18082;
+
+    # Monitoring reads and supported configuration writes. Policy/check/task
+    # CRUD, task execution and alert channel/template writes remain Django.
+    "~^(GET|HEAD):/(checks|tasks)/([0-9]+/)?$" 127.0.0.1:18082;
+    "~^PATCH:/checks/[0-9]+/history/$" 127.0.0.1:18082;
+    "~^(GET|HEAD):/automation/policies/(overview/|[0-9]+/(related/|checks/|tasks/)?)?$" 127.0.0.1:18082;
+    "~^(GET|HEAD):/automation/checks/[0-9]+/status/$" 127.0.0.1:18082;
+    "~^(GET|HEAD):/automation/tasks/[0-9]+/(status|run)/$" 127.0.0.1:18082;
+    "~^POST:/automation/patchpolicy/(reset/)?$" 127.0.0.1:18082;
+    "~^(PUT|DELETE):/automation/patchpolicy/[0-9]+/$" 127.0.0.1:18082;
+    "~^(GET|HEAD):/alerts/templates/([0-9]+/(related/)?)?$" 127.0.0.1:18082;
+    "~^(GET|HEAD|PUT|DELETE):/alerts/[0-9]+/$" 127.0.0.1:18082;
+    "~^PATCH:/alerts/$" 127.0.0.1:18082;
+    "~^POST:/alerts/bulk/$" 127.0.0.1:18082;
+    "~^PATCH:/logs/(audit|debug)/$" 127.0.0.1:18082;
+    "~^(GET|HEAD):/logs/pendingactions/$" 127.0.0.1:18082;
+
+    # Software and update inventories/approvals. Installation, scans, reboot,
+    # enrollment, software removal and other commands stay Django for this
+    # conservative staging profile. Expand explicitly after end-to-end checks.
+    "~^GET:/software/chocos/$" 127.0.0.1:18082;
+    "~^(GET|HEAD):/software/([^/]{21,}/)?$" 127.0.0.1:18082;
+    "~^(GET|HEAD):/winupdate/[^/]{21,}/$" 127.0.0.1:18082;
+    "~^PUT:/winupdate/(bulk|[0-9]+)/$" 127.0.0.1:18082;
+    "~^(GET|HEAD):/services/[^/]{21,}/([^/]+/)?$" 127.0.0.1:18082;
+
+    # Default also covers inventory/documents/reports/SNMP, MCP, Mesh,
+    # WebSocket/WebVNC, agent API v3/v4/beta and installer/update endpoints.
+}

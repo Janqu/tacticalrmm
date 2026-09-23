@@ -1,0 +1,86 @@
+name: Go API compatibility
+
+on:
+  push:
+    paths: ["api/go/**", "api/tacticalrmm/**", ".github/workflows/go-api.yml"]
+  pull_request:
+    paths: ["api/go/**", "api/tacticalrmm/**", ".github/workflows/go-api.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api/go
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["56379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: trmm-test-only
+          POSTGRES_DB: trmm_go_test
+        ports: ["55439:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go/go.mod
+          cache-dependency-path: api/go/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Formatting and unit tests
+        run: |
+          test -z "$(gofmt -l cmd internal)"
+          go vet ./...
+          go test -race ./...
+          python -m unittest discover -s tools -p 'test_*.py'
+          python tools/inventory.py --check
+      - name: Install Django reference dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpango-1.0-0 libpangoft2-1.0-0
+          python -m pip install -r ../tacticalrmm/requirements.txt
+          python -m pip install argon2-cffi bcrypt
+      - name: Compare with Django
+        run: |
+          python tools/auth_vectors.py --check
+          go build -o /tmp/tacticalrmm-go-api ./cmd/api
+          go build -o /tmp/tacticalrmm-go-mesh-sync ./cmd/mesh-sync
+          go build -o /tmp/tacticalrmm-go-jobs ./cmd/scheduled-jobs
+          python tools/compare_django.py --dsn postgresql://postgres:trmm-test-only@127.0.0.1:55439/trmm_go_test --go-binary /tmp/tacticalrmm-go-api --mesh-binary /tmp/tacticalrmm-go-mesh-sync
+          python tools/compare_django.py --dsn postgresql://postgres:trmm-test-only@127.0.0.1:55439/trmm_go_test --go-binary /tmp/tacticalrmm-go-api --jobs-binary /tmp/tacticalrmm-go-jobs --scheduled-jobs-only
+          python tools/compare_django.py --dsn postgresql://postgres:trmm-test-only@127.0.0.1:55439/trmm_go_test --go-binary /tmp/tacticalrmm-go-api --jobs-binary /tmp/tacticalrmm-go-jobs --winupdate-auto-approve-only --nats-url nats://127.0.0.1:54222
+          python tools/compare_script_expansion.py
+          python tools/compare_django.py --dsn postgresql://postgres:trmm-test-only@127.0.0.1:55439/trmm_go_test --go-binary /tmp/tacticalrmm-go-api --script-resolver-only
+          python tools/compare_django.py --dsn postgresql://postgres:trmm-test-only@127.0.0.1:55439/trmm_go_test --go-binary /tmp/tacticalrmm-go-api --winupdate-supersedence-only
+          python tools/compare_django.py --dsn postgresql://postgres:trmm-test-only@127.0.0.1:55439/trmm_go_test --go-binary /tmp/tacticalrmm-go-api --winupdate-policy-only
+          python tools/compare_django.py --dsn postgresql://postgres:trmm-test-only@127.0.0.1:55439/trmm_go_test --go-binary /tmp/tacticalrmm-go-api --winupdate-results-only
+          python tools/compare_django.py --dsn postgresql://postgres:trmm-test-only@127.0.0.1:55439/trmm_go_test --go-binary /tmp/tacticalrmm-go-api --winupdate-completion-only
+          python tools/compare_django.py --dsn postgresql://postgres:trmm-test-only@127.0.0.1:55439/trmm_go_test --go-binary /tmp/tacticalrmm-go-api --script-callbacks-only
+          python tools/compare_django.py --dsn postgresql://postgres:trmm-test-only@127.0.0.1:55439/trmm_go_test --go-binary /tmp/tacticalrmm-go-api --collector-callbacks-only
+      - name: Compare isolated agent commands
+        run: |
+          docker run -d --name trmm-nats-contracts -p 127.0.0.1:54222:4222 nats:2.11-alpine --user tacticalrmm --pass trmm-test-only
+          TRMM_TEST_NATS_URL=nats://127.0.0.1:54222 go test -race ./internal/agentbus -run TestPublishLocalBroker -count=1
+          python tools/compare_django.py --dsn postgresql://postgres:trmm-test-only@127.0.0.1:55439/trmm_go_test --go-binary /tmp/tacticalrmm-go-api --agent-commands-only --nats-url nats://127.0.0.1:54222
+          python tools/compare_django.py --dsn postgresql://postgres:trmm-test-only@127.0.0.1:55439/trmm_go_test --go-binary /tmp/tacticalrmm-go-api --script-execution-only --nats-url nats://127.0.0.1:54222
+          python tools/compare_django.py --dsn postgresql://postgres:trmm-test-only@127.0.0.1:55439/trmm_go_test --go-binary /tmp/tacticalrmm-go-api --async-script-execution-only --nats-url nats://127.0.0.1:54222
+          python tools/compare_django.py --dsn postgresql://postgres:trmm-test-only@127.0.0.1:55439/trmm_go_test --go-binary /tmp/tacticalrmm-go-api --script-notes-only --nats-url nats://127.0.0.1:54222
+          python tools/compare_django.py --dsn postgresql://postgres:trmm-test-only@127.0.0.1:55439/trmm_go_test --go-binary /tmp/tacticalrmm-go-api --script-collectors-only --nats-url nats://127.0.0.1:54222
+          python tools/compare_django.py --dsn postgresql://postgres:trmm-test-only@127.0.0.1:55439/trmm_go_test --go-binary /tmp/tacticalrmm-go-api --note-completion-only --nats-url nats://127.0.0.1:54222
