@@ -2,6 +2,7 @@ import datetime as dt
 
 from django.shortcuts import get_object_or_404
 from django.utils import timezone as djangotime
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -10,7 +11,7 @@ from agents.models import Agent
 from alerts.models import Alert
 from clients.models import Client
 from tacticalrmm.constants import AgentMonType
-from tacticalrmm.permissions import _has_perm_on_client
+from tacticalrmm.permissions import _has_perm
 
 PATCH_LOOKBACK_DAYS = 30
 
@@ -44,21 +45,22 @@ class ClientHealthReportView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, client_id: int):
-        client = get_object_or_404(Client, pk=client_id)
-
-        if not _has_perm_on_client(request.user, client.pk):
-            from rest_framework.exceptions import PermissionDenied
-
+        if not _has_perm(request, "can_list_agents"):
             raise PermissionDenied()
+
+        client = get_object_or_404(
+            Client.objects.filter_by_role(request.user), pk=client_id
+        )
 
         agents = (
             Agent.objects.filter(site__client=client)
+            .filter_by_role(request.user)
             .select_related("site")
             .order_by("hostname")
         )
 
         open_alerts = (
-            Alert.objects.filter(agent__site__client=client, resolved=False)
+            Alert.objects.filter(agent__in=agents, resolved=False)
             .select_related("agent")
             .order_by("-alert_time")
         )
@@ -116,9 +118,7 @@ class ClientHealthReportView(APIView):
                 "summary": {
                     "total_agents": len(agent_rows),
                     "servers": sum(
-                        1
-                        for a in agents
-                        if a.monitoring_type == AgentMonType.SERVER
+                        1 for a in agents if a.monitoring_type == AgentMonType.SERVER
                     ),
                     "workstations": sum(
                         1
@@ -129,9 +129,7 @@ class ClientHealthReportView(APIView):
                     "offline": totals["offline"],
                     "overdue": totals["overdue"],
                     "patches_pending": totals["patches_pending"],
-                    "patches_installed_recently": totals[
-                        "patches_installed_recently"
-                    ],
+                    "patches_installed_recently": totals["patches_installed_recently"],
                     "checks_failing": totals["checks_failing"],
                     "open_alerts": open_alerts.count(),
                 },
