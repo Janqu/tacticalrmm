@@ -16,14 +16,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Windows Driver Kit
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if (-not (Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\Inf2Cat.exe' -ErrorAction SilentlyContinue)) {
-            winget install --id Microsoft.WindowsWDK.10.0.26100 --exact --silent --accept-package-agreements --accept-source-agreements
-          }
-
       - uses: microsoft/setup-msbuild@v2
 
       - name: Verify source invariants
