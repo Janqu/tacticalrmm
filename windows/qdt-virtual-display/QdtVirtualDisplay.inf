@@ -52,11 +52,11 @@ UmdfKernelModeClientPolicy = AllowKernelModeClients
 
 [QdtVirtualDisplay_Install]
 UmdfLibraryVersion=$UMDFVERSION$
-ServiceBinary=%12%\UMDF\QdtVirtualDisplay.dll
+ServiceBinary=%13%\QdtVirtualDisplay.dll
 UmdfExtensions = IddCx0102
 
 [DestinationDirs]
-UMDriverCopy=12,UMDF ; copy to drivers\umdf
+UMDriverCopy=13
 
 [UMDriverCopy]
 QdtVirtualDisplay.dll

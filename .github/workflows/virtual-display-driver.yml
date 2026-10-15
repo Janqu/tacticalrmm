@@ -36,8 +36,9 @@ jobs:
           $package = Join-Path $PWD 'driver-package'
           New-Item -ItemType Directory -Path $package | Out-Null
           $dll = Get-ChildItem windows/qdt-virtual-display -Recurse -Filter QdtVirtualDisplay.dll | Where-Object FullName -Match 'Release' | Select-Object -First 1
-          if (-not $dll) { throw 'Release driver DLL was not produced' }
-          Copy-Item $dll.FullName, windows/qdt-virtual-display/QdtVirtualDisplay.inf -Destination $package
+          $inf = Get-ChildItem windows/qdt-virtual-display -Recurse -Filter QdtVirtualDisplay.inf | Where-Object FullName -Match 'Release' | Select-Object -First 1
+          if (-not $dll -or -not $inf) { throw 'Release driver package was not produced' }
+          Copy-Item $dll.FullName, $inf.FullName -Destination $package
           $toolRoots = 'wdk', 'C:\Program Files (x86)\Windows Kits\10'
           $infverif = Get-ChildItem $toolRoots -Recurse -Filter InfVerif.exe | Where-Object FullName -NotMatch '\\arm64\\' | Sort-Object FullName -Descending | Select-Object -First 1
           $inf2cat = Get-ChildItem $toolRoots -Recurse -Filter Inf2Cat.exe | Where-Object FullName -NotMatch '\\arm64\\' | Sort-Object FullName -Descending | Select-Object -First 1
