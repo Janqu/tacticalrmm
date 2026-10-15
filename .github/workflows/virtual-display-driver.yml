@@ -35,8 +35,8 @@ jobs:
           $dll = Get-ChildItem windows/qdt-virtual-display -Recurse -Filter QdtVirtualDisplay.dll | Where-Object FullName -Match 'Release' | Select-Object -First 1
           if (-not $dll) { throw 'Release driver DLL was not produced' }
           Copy-Item $dll.FullName, windows/qdt-virtual-display/QdtVirtualDisplay.inf -Destination $package
-          $infverif = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\InfVerif.exe' | Sort-Object FullName -Descending | Select-Object -First 1
-          $inf2cat = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\Inf2Cat.exe' | Sort-Object FullName -Descending | Select-Object -First 1
+          $infverif = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter InfVerif.exe | Where-Object FullName -NotMatch '\\arm64\\' | Sort-Object FullName -Descending | Select-Object -First 1
+          $inf2cat = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter Inf2Cat.exe | Where-Object FullName -NotMatch '\\arm64\\' | Sort-Object FullName -Descending | Select-Object -First 1
           if (-not $infverif -or -not $inf2cat) { throw 'WDK validation tools are missing' }
           & $infverif.FullName /w (Join-Path $package 'QdtVirtualDisplay.inf')
           if ($LASTEXITCODE) { throw "InfVerif failed with exit code $LASTEXITCODE" }
